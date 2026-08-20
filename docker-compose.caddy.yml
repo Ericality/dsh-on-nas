@@ -1,0 +1,16 @@
+services:
+  deepseek-harness:
+    image: dsh-nas-https:0.1.0-rc.6
+    container_name: deepseek-harness
+    restart: unless-stopped
+    shm_size: 1gb
+    ports:
+      - "8443:8443"
+    environment:
+      HTTPS_ACCESS_HOST: "${HTTPS_ACCESS_HOST}"
+      DSH_AUTH_USERNAME: "${DSH_AUTH_USERNAME}"
+      DSH_AUTH_PASSWORD: "${DSH_AUTH_PASSWORD}"
+      DSH_TELEMETRY_DISABLED: "1"
+    volumes:
+      - "${DSH_DATA_PATH}:/data/dsh"
+      - "${WORKSPACE_PATH}:/workspace"

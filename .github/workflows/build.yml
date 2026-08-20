@@ -1,0 +1,96 @@
+name: build-and-push
+
+on:
+  workflow_dispatch:
+    inputs:
+      dsh_version:
+        description: 'DSH 版本 (例如 0.1.0-rc.8); 留空 = 自动用 npm latest'
+        required: false
+        default: ''
+      npm_registry:
+        description: 'npm 镜像 (国内可用 https://registry.npmmirror.com)'
+        required: false
+        default: 'https://registry.npmjs.org'
+  schedule:
+    # 每天检查一次 npm 新版本, 有更新才重建
+    - cron: '0 2 * * *'
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'Dockerfile.caddy'
+      - 'entrypoint.sh'
+      - 'entrypoint.caddy.sh'
+      - 'Caddyfile'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          if [ -n "${{ inputs.dsh_version }}" ]; then
+            V="${{ inputs.dsh_version }}"
+          else
+            V="$(docker run --rm node:22-alpine npm view @deepseek-ai/dsh@latest version 2>/dev/null | tail -1)"
+          fi
+          if [ -z "$V" ]; then
+            echo "!! 无法获取版本号" >&2
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - dockerfile: Dockerfile
+            image: dsh-nas
+          - dockerfile: Dockerfile.caddy
+            image: dsh-nas-https
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本没变则跳过 (避免每天重复构建同一版本)
+        id: skip-check
+        run: |
+          if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.resolve-version.outputs.version }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.skip-check.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        if: steps.skip-check.outputs.skip != 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送
+        if: steps.skip-check.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          build-args: |
+            DSH_VERSION=${{ needs.resolve-version.outputs.version }}
+            NPM_REGISTRY=${{ inputs.npm_registry }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.resolve-version.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:latest

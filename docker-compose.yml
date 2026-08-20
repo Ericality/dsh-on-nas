@@ -1,0 +1,19 @@
+services:
+  deepseek-harness:
+    # 本地构建用 dsh-nas:latest; 用 GitHub Actions 推送的镜像则设置
+    # DSH_IMAGE=ghcr.io/你的用户名/dsh-nas:latest
+    image: ${DSH_IMAGE:-dsh-nas:latest}
+    container_name: deepseek-harness
+    restart: unless-stopped
+    shm_size: 1gb
+    ports:
+      # 左边是宿主机端口, 若 3080 被占用可改成别的, 如 "18080:3080"
+      - "3080:3080"
+    environment:
+      # 设置这两个才启用 basic auth (推荐局域网也开启)
+      DSH_AUTH_USERNAME: "${DSH_AUTH_USERNAME}"
+      DSH_AUTH_PASSWORD: "${DSH_AUTH_PASSWORD}"
+      DSH_TELEMETRY_DISABLED: "1"
+    volumes:
+      - "${DSH_DATA_PATH}:/data/dsh"
+      - "${WORKSPACE_PATH}:/workspace"
