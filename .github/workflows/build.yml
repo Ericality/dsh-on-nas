@@ -60,10 +60,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: 计算小写 owner (GHCR 仓库名必须全小写)
+        id: owner
+        run: |
+          LOWER="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "lower=$LOWER" >> "$GITHUB_OUTPUT"
+          echo "GHCR 命名空间: ghcr.io/$LOWER"
+
       - name: 版本没变则跳过 (避免每天重复构建同一版本)
         id: skip-check
         run: |
-          if docker manifest inspect "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.resolve-version.outputs.version }}" >/dev/null 2>&1; then
+          if docker manifest inspect "ghcr.io/${{ steps.owner.outputs.lower }}/${{ matrix.image }}:${{ needs.resolve-version.outputs.version }}" >/dev/null 2>&1; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -92,5 +99,5 @@ jobs:
             NPM_REGISTRY=${{ inputs.npm_registry }}
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ needs.resolve-version.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:latest
+            ghcr.io/${{ steps.owner.outputs.lower }}/${{ matrix.image }}:${{ needs.resolve-version.outputs.version }}
+            ghcr.io/${{ steps.owner.outputs.lower }}/${{ matrix.image }}:latest
