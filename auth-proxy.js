@@ -134,7 +134,7 @@ function proxy(req, res) {
   const headers = Object.assign({}, req.headers);
   headers.host = u.host;
   headers.origin = u.origin; // 围栏要求 Origin 与 Host 同源(回环)
-  headers['x-forwarded-for'] = req.socket.remoteAddress || '';
+  headers['x-forwarded-for'] = clientIp(req);
   const preq = http.request({
     hostname: u.hostname, port: u.port || 80,
     path: req.url, method: req.method, headers,
@@ -150,9 +150,15 @@ function proxy(req, res) {
 }
 
 // ---------- 主服务 ----------
+function clientIp(req) {
+  // 走 Cloudflare Tunnel 时所有请求都来自 cloudflared 的同一 IP,
+  // 用 Cf-Connecting-Ip 取真实客户端 IP (用于防爆破和 X-Forwarded-For)
+  return String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress || '?');
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const ip = req.socket.remoteAddress || '?';
+  const ip = clientIp(req);
 
   // 无认证模式: 纯转发
   if (!authOn) { proxy(req, res); return; }
