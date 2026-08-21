@@ -65,10 +65,11 @@ function readCookie(req) {
   return m ? verify(decodeURIComponent(m[1])) : null;
 }
 function sessionCookie(token) {
-  return `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}`;
+  // SameSite=Lax: 顶层导航(书签/外部链接/切回标签)会带 Cookie, 跨站子请求仍拦截
+  return `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${SESSION_DAYS * 86400}`;
 }
 function clearCookie() {
-  return `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`;
+  return `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
 }
 
 // ---------- 登录校验 (常数时间比较) ----------
@@ -218,7 +219,12 @@ const handler = (req, res) => {
   }
 
   // 其余路径: 校验会话
-  if (!readCookie(req)) { res.writeHead(302, { Location: '/login' }); res.end(); return; }
+  const session = readCookie(req);
+  if (!session) {
+    // 调试用: 区分"浏览器没发 Cookie" vs "Cookie 有但签名/过期无效"
+    dlog('session-reject', url.pathname, 'from', ip, '->', req.headers.cookie ? 'cookie-present-but-invalid' : 'cookie-missing');
+    res.writeHead(302, { Location: '/login' }); res.end(); return;
+  }
   proxy(req, res);
 };
 
