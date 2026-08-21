@@ -146,16 +146,22 @@ function sendLogin(res, insecureLan) {
 }
 
 // ---------- 转发到 dsh web (改写 Host/Origin 通过信任围栏) ----------
-function proxy(req, res) {
+function upstreamOptions(req) {
   const u = new URL(UPSTREAM);
   const headers = Object.assign({}, req.headers);
   headers.host = u.host;
   headers.origin = u.origin; // 围栏要求 Origin 与 Host 同源(回环)
   headers['x-forwarded-for'] = clientIp(req);
-  const preq = http.request({
-    hostname: u.hostname, port: u.port || 80,
-    path: req.url, method: req.method, headers,
-  }, (pres) => {
+  return { hostname: u.hostname, port: u.port || 80, path: req.url, method: req.method, headers };
+}
+
+function proxy(req, res) {
+  const opts = upstreamOptions(req);
+  // 去掉 hop-by-hop 头, 让 Node 自己管理连接与分块编码
+  for (const h of ['connection', 'transfer-encoding', 'keep-alive', 'proxy-connection', 'upgrade']) {
+    delete opts.headers[h];
+  }
+  const preq = http.request(opts, (pres) => {
     res.writeHead(pres.statusCode, pres.headers);
     pres.pipe(res);
   });
@@ -164,6 +170,43 @@ function proxy(req, res) {
     else res.end();
   });
   req.pipe(preq);
+}
+
+// ---------- WebSocket 升级转发 ----------
+// dsh 的实时事件流走 /api/events.mux 和 /api/events.host 两条 WebSocket 下行连接,
+// 普通 HTTP 代理不处理 Upgrade 请求, 必须单独转发 (否则界面无实时更新, 只能刷新看进度)
+function handleUpgrade(req, socket, head) {
+  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const reject = (code, msg) => {
+    dlog('ws-reject', url.pathname, 'from', clientIp(req), '->', msg);
+    socket.write(`HTTP/1.1 ${code} ${msg}\r\nConnection: close\r\n\r\n`);
+    socket.destroy();
+  };
+
+  // 校验会话 (与普通请求一致)
+  if (authOn && !readCookie(req)) {
+    reject(401, 'Unauthorized');
+    return;
+  }
+
+  const opts = upstreamOptions(req); // 保留 Connection: upgrade / Upgrade: websocket
+  const wreq = http.request(opts);
+  wreq.on('upgrade', (upRes, upSocket, upHead) => {
+    // 把上游的 101 响应与后续双向数据转发给客户端
+    const statusLine = `HTTP/1.1 ${upRes.statusCode} ${upRes.statusMessage || 'Switching Protocols'}\r\n`;
+    let headerStr = '';
+    for (const [k, v] of Object.entries(upRes.headers)) {
+      if (Array.isArray(v)) v.forEach((x) => { headerStr += `${k}: ${x}\r\n`; });
+      else headerStr += `${k}: ${v}\r\n`;
+    }
+    socket.write(statusLine + headerStr + '\r\n');
+    socket.write(upHead);
+    upSocket.write(head);
+    upSocket.pipe(socket);
+    socket.pipe(upSocket);
+  });
+  wreq.on('error', () => socket.destroy());
+  wreq.end();
 }
 
 // ---------- 主服务 ----------
@@ -231,6 +274,7 @@ const handler = (req, res) => {
 // ---------- HTTP + HTTPS 双端口 ----------
 const servers = [];
 const httpServer = http.createServer(handler);
+httpServer.on('upgrade', handleUpgrade); // WebSocket 实时事件流
 servers.push(httpServer);
 httpServer.listen(HTTP_PORT, LISTEN_HOST, () => {
   console.log(`auth-proxy: http  ${LISTEN_HOST}:${HTTP_PORT} (隧道回源/SSH隧道/localhost用) -> ${UPSTREAM}${authOn ? ' (auth ON)' : ' (auth OFF, 仅限可信局域网)'}`);
@@ -242,6 +286,7 @@ if (useTls) {
     { key: fs.readFileSync(TLS_KEY), cert: fs.readFileSync(TLS_CERT) },
     handler
   );
+  httpsServer.on('upgrade', handleUpgrade);
   servers.push(httpsServer);
   httpsServer.listen(HTTPS_PORT, LISTEN_HOST, () => {
     console.log(`auth-proxy: https ${LISTEN_HOST}:${HTTPS_PORT} (局域网直连用, 自签名证书) -> ${UPSTREAM}`);
