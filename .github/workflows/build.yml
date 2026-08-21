@@ -22,6 +22,12 @@ on:
       - 'entrypoint.sh'
       - 'entrypoint.caddy.sh'
       - 'Caddyfile'
+      - 'auth-proxy.js'
+      - 'docker-compose.yml'
+      - 'docker-compose.caddy.yml'
+      - '.env.example'
+      - 'README.md'
+      - 'build.sh'
       - '.github/workflows/build.yml'
 
 permissions:
