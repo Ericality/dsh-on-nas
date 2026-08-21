@@ -29,7 +29,7 @@ ENV HOME=/data/dsh \
     DSH_HOME=/data/dsh \
     DSH_TELEMETRY_DISABLED=1
 
-# 构建依赖 (dsh 部分插件需要原生编译)
+# 构建依赖 (dsh 部分插件需要原生编译) + openssl (启动时生成自签名证书)
 RUN echo '#!/bin/sh\nexit 0' > /usr/sbin/policy-rc.d \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -38,6 +38,7 @@ RUN echo '#!/bin/sh\nexit 0' > /usr/sbin/policy-rc.d \
        python3 \
        make \
        g++ \
+       openssl \
     && rm -f /usr/sbin/policy-rc.d \
     && rm -rf /var/lib/apt/lists/*
 

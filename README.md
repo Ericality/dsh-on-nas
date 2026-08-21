@@ -1,9 +1,18 @@
-# 自建 DeepSeek Harness — 无 Caddy / 无强制 HTTPS / 前端登录页 / 可追新版本
+# 自建 DeepSeek Harness — 无 Caddy / HTTPS 可选 / 前端登录页 / 可追新版本
 
 针对 `ghcr.io/kanzuori197/deepseek-harness-nas` 的痛点重写:
-**① 去掉 Caddy 和强制 HTTPS/自签名证书** → 局域网直接访问 `http://NAS_IP:3080`;
+**① 去掉 Caddy, 不再强制 HTTPS** → 默认 `http://NAS_IP:3080`, 设 `HTTPS_ACCESS_HOST`
+即自动启用 HTTPS (自签名, 仅首次访问点一次信任);
 **② 告别 basic auth 浏览器弹窗** → 前端登录页面 + 会话 Cookie;
 **③ 不锁死旧 rc 版本** → `build.sh` 或 GitHub Actions 自动追 npm 最新版。
+
+> ⚠️ **为什么局域网直连必须有 HTTPS**: dsh 前端会调用浏览器
+> `crypto.randomUUID()`, 它只在**安全上下文**(HTTPS 或 localhost)中可用。
+> 纯 HTTP 的 `http://NAS_IP:3080` 直连时 UI 会报
+> `crypto.randomUUID is not a function`。所以:
+> - 局域网直接访问 → 必须设置 `HTTPS_ACCESS_HOST` 启用自签名 HTTPS;
+> - 只走 Cloudflare 隧道(`https://域名`)或 SSH 隧道(`http://localhost`)→ 本身是
+>   安全上下文, 可留空保持纯 HTTP。
 
 ## 为什么还需要一层反代?
 
@@ -36,19 +45,21 @@
 
 ```
 dsh web       127.0.0.1:3081   (仅回环, 官方禁止 0.0.0.0)
-auth-proxy    0.0.0.0:3080     (对外: 登录页 + 转发)
+auth-proxy    0.0.0.0:3080     (对外: 登录页 + 转发; 设 HTTPS_ACCESS_HOST 则为 HTTPS)
 ```
 
 ## 快速开始
 
 ```bash
 cd /workspace/projects/dsh-nas   # 拷到 NAS 后在此目录执行
-cp .env.example .env             # 编辑 .env: 用户名/密码/路径
+cp .env.example .env             # 编辑 .env: 用户名/密码/路径 + HTTPS_ACCESS_HOST
 ./build.sh                       # 构建 npm latest 版本 (当前 rc.7)
 docker compose up -d
 ```
 
-浏览器访问 `http://NAS_IP:3080`,先登录再使用。
+浏览器访问 `http://NAS_IP:3080`(未设 HTTPS_ACCESS_HOST 时)或
+`https://NAS_IP:3080`(设置了 HTTPS_ACCESS_HOST, 首次访问点一次"继续前往"),
+先登录再使用。
 
 ## 更新版本(不再定死)
 

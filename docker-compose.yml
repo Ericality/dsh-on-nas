@@ -10,10 +10,19 @@ services:
       # 左边是宿主机端口, 若 3080 被占用可改成别的, 如 "18080:3080"
       - "3080:3080"
     environment:
-      # 设置这两个才启用 basic auth (推荐局域网也开启)
+      # 登录页认证 (推荐必须设置, 尤其公网)
       DSH_AUTH_USERNAME: "${DSH_AUTH_USERNAME}"
       DSH_AUTH_PASSWORD: "${DSH_AUTH_PASSWORD}"
+      # 可选: 设置这个才启用 HTTPS (自签名证书, 浏览器首次访问点一次信任)
+      # 填 NAS 的局域网 IP 或域名, 不带协议和端口, 如 192.168.1.100 或 nas.example.com
+      # 原因: dsh 前端用 crypto.randomUUID, 浏览器只在 HTTPS/localhost 提供,
+      #       纯 HTTP 局域网直连会导致 UI 报错。不设置则纯 HTTP (仅限 localhost/SSH 隧道/Cloudflare 隧道)
+      HTTPS_ACCESS_HOST: "${HTTPS_ACCESS_HOST}"
       DSH_TELEMETRY_DISABLED: "1"
+      # 可选: DSH_SESSION_DAYS: "7"   会话有效期天数
+      # 可选: DSH_AUTH_DEBUG: "1"     登录调试日志
     volumes:
+      # 数据目录 (含对话记录, 备份它!)
       - "${DSH_DATA_PATH}:/data/dsh"
+      # 工作目录 (AI 干活的地方, 只放允许 AI 操作的目录)
       - "${WORKSPACE_PATH}:/workspace"

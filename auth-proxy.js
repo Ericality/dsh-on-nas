@@ -15,6 +15,12 @@
 
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+
+// TLS (自签名): DSH_TLS=1 且证书存在时启用 HTTPS
+const TLS_CERT = process.env.DSH_TLS_CERT || '/etc/dsh-tls/cert.pem';
+const TLS_KEY = process.env.DSH_TLS_KEY || '/etc/dsh-tls/key.pem';
+const useTls = process.env.DSH_TLS === '1' && fs.existsSync(TLS_CERT) && fs.existsSync(TLS_KEY);
 
 const LISTEN_PORT = parseInt(process.env.DSH_LISTEN_PORT || '3080', 10);
 const LISTEN_HOST = process.env.DSH_LISTEN_HOST || '0.0.0.0';
@@ -54,10 +60,10 @@ function readCookie(req) {
   return m ? verify(decodeURIComponent(m[1])) : null;
 }
 function sessionCookie(token) {
-  return `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}`;
+  return `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}${useTls ? '; Secure' : ''}`;
 }
 function clearCookie() {
-  return `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`;
+  return `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${useTls ? '; Secure' : ''}`;
 }
 
 // ---------- 登录校验 (常数时间比较) ----------
@@ -156,7 +162,7 @@ function clientIp(req) {
   return String(req.headers['cf-connecting-ip'] || req.socket.remoteAddress || '?');
 }
 
-const server = http.createServer((req, res) => {
+const handler = (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const ip = clientIp(req);
 
@@ -199,10 +205,22 @@ const server = http.createServer((req, res) => {
   // 其余路径: 校验会话
   if (!readCookie(req)) { res.writeHead(302, { Location: '/login' }); res.end(); return; }
   proxy(req, res);
-});
+};
+
+// ---------- HTTP / HTTPS (自签名证书) ----------
+let server;
+if (useTls) {
+  const https = require('https');
+  server = https.createServer(
+    { key: fs.readFileSync(TLS_KEY), cert: fs.readFileSync(TLS_CERT) },
+    handler
+  );
+} else {
+  server = http.createServer(handler);
+}
 
 server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  console.log(`auth-proxy: listening on ${LISTEN_HOST}:${LISTEN_PORT} -> ${UPSTREAM}${authOn ? ' (auth ON)' : ' (auth OFF, 无认证! 仅限可信局域网)'}`);
+  console.log(`auth-proxy: listening on ${useTls ? 'https' : 'http'}://${LISTEN_HOST}:${LISTEN_PORT} -> ${UPSTREAM}${authOn ? ' (auth ON)' : ' (auth OFF, 无认证! 仅限可信局域网)'}`);
 });
 
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
