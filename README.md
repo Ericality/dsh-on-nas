@@ -1,8 +1,8 @@
-# 自建 DeepSeek Harness — 无 Caddy / HTTPS 可选 / 前端登录页 / 可追新版本
+# 自建 DeepSeek Harness — 无 Caddy / 双端口(HTTP+HTTPS) / 前端登录页 / 可追新版本
 
 针对 `ghcr.io/kanzuori197/deepseek-harness-nas` 的痛点重写:
-**① 去掉 Caddy, 不再强制 HTTPS** → 默认 `http://NAS_IP:3080`, 设 `HTTPS_ACCESS_HOST`
-即自动启用 HTTPS (自签名, 仅首次访问点一次信任);
+**① 去掉 Caddy** → auth-proxy 双端口: `:3080` HTTP 给 Cloudflare 隧道回源/SSH 隧道,
+`:8443` HTTPS(自签名)给局域网直连;
 **② 告别 basic auth 浏览器弹窗** → 前端登录页面 + 会话 Cookie;
 **③ 不锁死旧 rc 版本** → `build.sh` 或 GitHub Actions 自动追 npm 最新版。
 
@@ -10,9 +10,10 @@
 > `crypto.randomUUID()`, 它只在**安全上下文**(HTTPS 或 localhost)中可用。
 > 纯 HTTP 的 `http://NAS_IP:3080` 直连时 UI 会报
 > `crypto.randomUUID is not a function`。所以:
-> - 局域网直接访问 → 必须设置 `HTTPS_ACCESS_HOST` 启用自签名 HTTPS;
-> - 只走 Cloudflare 隧道(`https://域名`)或 SSH 隧道(`http://localhost`)→ 本身是
->   安全上下文, 可留空保持纯 HTTP。
+> - **局域网直连** → 用 `https://NAS_IP:8443`(设 `HTTPS_ACCESS_HOST`, 首次点一次信任);
+> - **Cloudflare 隧道回源** → 用 `http://NAS_IP:3080`(**不需要忽略证书**,
+>   回源本来就是 HTTP; 浏览器连的是 Cloudflare 边缘的正式 HTTPS);
+> - **SSH 隧道** → `http://localhost:3080`(localhost 即安全上下文, 免证书)。
 
 ## 为什么还需要一层反代?
 
@@ -45,8 +46,12 @@
 
 ```
 dsh web       127.0.0.1:3081   (仅回环, 官方禁止 0.0.0.0)
-auth-proxy    0.0.0.0:3080     (对外: 登录页 + 转发; 设 HTTPS_ACCESS_HOST 则为 HTTPS)
+auth-proxy    0.0.0.0:3080     HTTP  (Cloudflare 隧道回源 / SSH 隧道 / localhost)
+auth-proxy    0.0.0.0:8443     HTTPS (局域网直连, 自签名; 设 HTTPS_ACCESS_HOST 才有)
 ```
+
+两个端口共用同一登录页和会话(Cookie 不区分端口, 登录一次两边都有效),
+都转发到 `127.0.0.1:3081` 的 dsh web。
 
 ## 快速开始
 
@@ -57,9 +62,12 @@ cp .env.example .env             # 编辑 .env: 用户名/密码/路径 + HTTPS_
 docker compose up -d
 ```
 
-浏览器访问 `http://NAS_IP:3080`(未设 HTTPS_ACCESS_HOST 时)或
-`https://NAS_IP:3080`(设置了 HTTPS_ACCESS_HOST, 首次访问点一次"继续前往"),
-先登录再使用。
+- 局域网: `https://NAS_IP:8443`(首次访问点一次"继续前往", 之后正常)
+- 外网: Cloudflare 隧道回源 `http://NAS_IP:3080`(不用忽略证书)
+- 电脑: SSH 隧道后 `http://localhost:3080`
+
+> 若通过明文 HTTP 且非 localhost 访问(如手滑开了 `http://NAS_IP:3080`),
+> 登录页会显示黄色提示条提醒改用 HTTPS——因为那种方式下 UI 必然报错。
 
 ## 更新版本(不再定死)
 
@@ -74,14 +82,15 @@ docker compose up -d --force-recreate   # 重建容器应用新版本
 `DSH_VERSION` 参数构建,所以每次更新就是两行命令。国内网络可加
 `NPM_REGISTRY=https://registry.npmmirror.com ./build.sh`。
 
-## 内网穿透(节点小宝等)
+## 内网穿透(节点小宝 / Cloudflare Tunnel 等)
 
-回源填 `http://NAS_IP:3080` 即可,不再需要"跳过证书验证"。
+回源填 **`http://NAS_IP:3080`** 即可——回源是明文 HTTP,**不需要"忽略证书"配置**,
+浏览器连的是隧道边缘的正式 HTTPS(安全上下文, UI 正常)。
 **穿透到公网必须设置认证**,否则等于裸奔。
 
 ## 安全注意
 
-- 明文 HTTP 只适合局域网;公网访问请务必开认证或挂你自己的 HTTPS 反代。
+- 公网访问请务必开登录认证;局域网 3080 端口只用于隧道回源/SSH, 不要直接浏览器打开。
 - 会话 Cookie 是签名无状态的,没有服务端存储;容器重启后随机密钥变化,
   所有会话失效,重新登录即可(可接受)。
 - `dsh` 会**执行项目命令**,只挂载允许 AI 操作的目录,不要挂 NAS 根目录。
@@ -92,18 +101,19 @@ docker compose up -d --force-recreate   # 重建容器应用新版本
 
 | 文件 | 用途 |
 |---|---|
-| `Dockerfile` / `entrypoint.sh` | 默认方案: auth-proxy 登录页 + 转发, `3080` 端口 |
+| `Dockerfile` / `entrypoint.sh` | 默认方案: auth-proxy 双端口(HTTP 3080 + HTTPS 8443) |
 | `auth-proxy.js` | 登录认证代理 (纯 Node 零依赖, 已在真实 dsh web 上实测) |
 | `docker-compose.yml` / `.env.example` | 默认方案 compose |
 | `build.sh` | 一键查版本 + 构建 + 打 latest 标签 |
-| `Dockerfile.caddy` / `Caddyfile` / `entrypoint.caddy.sh` / `docker-compose.caddy.yml` | 可选 HTTPS 变体, 等价于 ghcr.io 原镜像 |
+| `Dockerfile.caddy` / `Caddyfile` / `entrypoint.caddy.sh` / `docker-compose.caddy.yml` | 可选 Caddy HTTPS 变体, 等价于 ghcr.io 原镜像 |
 
 ## 对比 ghcr.io/kanzuori197/deepseek-harness-nas
 
 | | ghcr.io 原镜像 | 本方案 (默认) |
 |---|---|---|
-| 协议 | HTTPS 自签名证书 | 纯 HTTP |
-| 访问 | `https://NAS:8443` + 证书警告 | `http://NAS:3080` 无警告 |
+| 协议 | 强制 HTTPS 自签名 | 双端口: HTTP 3080 + HTTPS 8443 (可选) |
+| 局域网 | `https://NAS:8443` + 证书警告 | `https://NAS_IP:8443` 首次点一次信任 |
+| 隧道回源 | HTTPS + 需忽略证书 | **HTTP 3080, 不用忽略证书** |
 | 版本 | 固定 0.1.0-rc.6 | `build.sh`/Actions 一键追 latest/next |
 | 认证 | basic auth 浏览器弹窗 | 前端登录页 + 会话 Cookie |
 | 反代 | Caddy | Node auth-proxy (或 SSH 隧道) |

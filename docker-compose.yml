@@ -7,16 +7,15 @@ services:
     restart: unless-stopped
     shm_size: 1gb
     ports:
-      # 左边是宿主机端口, 若 3080 被占用可改成别的, 如 "18080:3080"
-      - "3080:3080"
+      - "3080:3080"   # HTTP: 给 Cloudflare Tunnel 回源 / SSH 隧道 (免证书)
+      - "8443:8443"   # HTTPS: 给局域网直连 (自签名, 首次点一次信任; 设置 HTTPS_ACCESS_HOST 才有)
     environment:
       # 登录页认证 (推荐必须设置, 尤其公网)
       DSH_AUTH_USERNAME: "${DSH_AUTH_USERNAME}"
       DSH_AUTH_PASSWORD: "${DSH_AUTH_PASSWORD}"
-      # 可选: 设置这个才启用 HTTPS (自签名证书, 浏览器首次访问点一次信任)
-      # 填 NAS 的局域网 IP 或域名, 不带协议和端口, 如 192.168.1.100 或 nas.example.com
-      # 原因: dsh 前端用 crypto.randomUUID, 浏览器只在 HTTPS/localhost 提供,
-      #       纯 HTTP 局域网直连会导致 UI 报错。不设置则纯 HTTP (仅限 localhost/SSH 隧道/Cloudflare 隧道)
+      # 设置这个才启用 8443 HTTPS (自签名证书, 浏览器首次访问点一次信任)
+      # 填 NAS 的局域网 IP 或域名, 不带协议和端口, 如 192.168.1.100
+      # 原因: dsh 前端用 crypto.randomUUID, 浏览器只在 HTTPS/localhost 提供
       HTTPS_ACCESS_HOST: "${HTTPS_ACCESS_HOST}"
       DSH_TELEMETRY_DISABLED: "1"
       # 可选: DSH_SESSION_DAYS: "7"   会话有效期天数

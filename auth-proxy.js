@@ -2,13 +2,16 @@
 // ============================================================
 // 轻量登录认证反代 (零依赖, 纯 Node 标准库)
 //
-//   对外 0.0.0.0:3080 (登录页 + 会话)  ->  127.0.0.1:3081 (dsh web)
+//   对外双端口 (登录页 + 会话)  ->  127.0.0.1:3081 (dsh web)
+//     :3080  HTTP   给 Cloudflare Tunnel 回源 / SSH 隧道 / localhost
+//     :8443  HTTPS  给局域网直连 (自签名证书, 浏览器首次访问点一次信任)
 //
 // 特性:
 //   - 前端登录页面 (替代浏览器 basic auth 弹窗)
 //   - HttpOnly + SameSite 签名会话 Cookie (HMAC, 无状态, 默认 7 天)
 //   - 改写 Host/Origin 通过 dsh 的 /api 浏览器信任围栏
-//   - 防爆破: 同一 IP 5 次失败锁 60 秒
+//   - 防爆破: 同一 IP 5 次失败锁 60 秒 (隧道场景用 Cf-Connecting-Ip 按真实 IP)
+//   - 登录页智能提示: 明文 HTTP 且非 localhost 且非隧道访问时, 提示改用 HTTPS
 //   - 未设置 DSH_AUTH_USERNAME/PASSWORD 时: 纯转发模式 (无认证, 仅限可信局域网)
 // ============================================================
 'use strict';
@@ -17,12 +20,13 @@ const http = require('http');
 const crypto = require('crypto');
 const fs = require('fs');
 
-// TLS (自签名): DSH_TLS=1 且证书存在时启用 HTTPS
+// TLS (自签名): DSH_TLS=1 且证书存在时额外监听 HTTPS 端口
 const TLS_CERT = process.env.DSH_TLS_CERT || '/etc/dsh-tls/cert.pem';
 const TLS_KEY = process.env.DSH_TLS_KEY || '/etc/dsh-tls/key.pem';
 const useTls = process.env.DSH_TLS === '1' && fs.existsSync(TLS_CERT) && fs.existsSync(TLS_KEY);
 
-const LISTEN_PORT = parseInt(process.env.DSH_LISTEN_PORT || '3080', 10);
+const HTTP_PORT = parseInt(process.env.DSH_HTTP_PORT || '3080', 10);
+const HTTPS_PORT = parseInt(process.env.DSH_HTTPS_PORT || '8443', 10);
 const LISTEN_HOST = process.env.DSH_LISTEN_HOST || '0.0.0.0';
 const UPSTREAM = process.env.DSH_UPSTREAM || 'http://127.0.0.1:3081';
 const USER = process.env.DSH_AUTH_USERNAME || '';
@@ -37,6 +41,7 @@ const secret = crypto.randomBytes(32).toString('hex');
 const authOn = USER !== '' && PASS !== '';
 
 // ---------- 会话 ----------
+// 注意: Cookie 不加 Secure —— 双端口共用同一会话 (HTTPS 登录后切 HTTP 端口仍有效)
 function sign(payload) {
   const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
   const sig = crypto.createHmac('sha256', secret).update(data).digest('base64url');
@@ -60,10 +65,10 @@ function readCookie(req) {
   return m ? verify(decodeURIComponent(m[1])) : null;
 }
 function sessionCookie(token) {
-  return `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}${useTls ? '; Secure' : ''}`;
+  return `${COOKIE_NAME}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_DAYS * 86400}`;
 }
 function clearCookie() {
-  return `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${useTls ? '; Secure' : ''}`;
+  return `${COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`;
 }
 
 // ---------- 登录校验 (常数时间比较) ----------
@@ -113,8 +118,10 @@ const LOGIN_HTML = `<!doctype html>
   button { width: 100%; margin-top: 22px; padding: 11px; border: 0; border-radius: 8px; background: #4d6bfe; color: #fff; font-size: 15px; cursor: pointer; }
   button:hover { background: #3d59e0; }
   .err { display: none; margin-top: 14px; padding: 8px 10px; border-radius: 8px; background: #fdeaea; color: #c0392b; font-size: 13px; }
+  .hint { display: none; margin-bottom: 16px; padding: 9px 11px; border-radius: 8px; background: #fff8e6; border: 1px solid #f0d48a; color: #8a6d1a; font-size: 13px; line-height: 1.5; }
 </style></head><body>
 <div class="card">
+  <div class="hint" id="hint">当前是明文 HTTP 访问。局域网请使用 <b>https://NAS_IP:8443</b> 访问, 否则界面无法正常工作。</div>
   <h1>DeepSeek Harness</h1>
   <p class="sub">请输入访问凭据</p>
   <form method="post" action="/login">
@@ -126,12 +133,15 @@ const LOGIN_HTML = `<!doctype html>
   </form>
   <div class="err" id="err">用户名或密码错误, 请重试</div>
 </div>
-<script>if (location.search.includes('err=1')) document.getElementById('err').style.display='block';</script>
+<script>
+if (location.search.includes('err=1')) document.getElementById('err').style.display='block';
+if (__INSECURE_LAN__) document.getElementById('hint').style.display='block';
+</script>
 </body></html>`;
 
-function sendLogin(res) {
+function sendLogin(res, insecureLan) {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(LOGIN_HTML);
+  res.end(LOGIN_HTML.replace('__INSECURE_LAN__', insecureLan ? 'true' : 'false'));
 }
 
 // ---------- 转发到 dsh web (改写 Host/Origin 通过信任围栏) ----------
@@ -165,6 +175,11 @@ function clientIp(req) {
 const handler = (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const ip = clientIp(req);
+  const host = req.headers.host || '';
+  // 明文 HTTP + 非 localhost + 非隧道 -> 提示改用 HTTPS (安全上下文问题)
+  const insecureLan = !req.socket.encrypted
+    && !/^(localhost|127\.0\.0\.1|::1|\[::1\])(:\d+)?$/i.test(host)
+    && !req.headers['cf-connecting-ip'];
 
   // 无认证模式: 纯转发
   if (!authOn) { proxy(req, res); return; }
@@ -193,7 +208,7 @@ const handler = (req, res) => {
     }
     // GET /login
     if (readCookie(req)) { res.writeHead(302, { Location: '/' }); res.end(); return; }
-    sendLogin(res);
+    sendLogin(res, insecureLan);
     return;
   }
   if (url.pathname === '/logout') {
@@ -207,21 +222,28 @@ const handler = (req, res) => {
   proxy(req, res);
 };
 
-// ---------- HTTP / HTTPS (自签名证书) ----------
-let server;
+// ---------- HTTP + HTTPS 双端口 ----------
+const servers = [];
+const httpServer = http.createServer(handler);
+servers.push(httpServer);
+httpServer.listen(HTTP_PORT, LISTEN_HOST, () => {
+  console.log(`auth-proxy: http  ${LISTEN_HOST}:${HTTP_PORT} (隧道回源/SSH隧道/localhost用) -> ${UPSTREAM}${authOn ? ' (auth ON)' : ' (auth OFF, 仅限可信局域网)'}`);
+});
+
 if (useTls) {
   const https = require('https');
-  server = https.createServer(
+  const httpsServer = https.createServer(
     { key: fs.readFileSync(TLS_KEY), cert: fs.readFileSync(TLS_CERT) },
     handler
   );
-} else {
-  server = http.createServer(handler);
+  servers.push(httpsServer);
+  httpsServer.listen(HTTPS_PORT, LISTEN_HOST, () => {
+    console.log(`auth-proxy: https ${LISTEN_HOST}:${HTTPS_PORT} (局域网直连用, 自签名证书) -> ${UPSTREAM}`);
+  });
 }
 
-server.listen(LISTEN_PORT, LISTEN_HOST, () => {
-  console.log(`auth-proxy: listening on ${useTls ? 'https' : 'http'}://${LISTEN_HOST}:${LISTEN_PORT} -> ${UPSTREAM}${authOn ? ' (auth ON)' : ' (auth OFF, 无认证! 仅限可信局域网)'}`);
-});
-
-process.on('SIGTERM', () => server.close(() => process.exit(0)));
-process.on('SIGINT', () => server.close(() => process.exit(0)));
+function shutdown() {
+  servers.forEach((s) => s.close(() => process.exit(0)));
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
