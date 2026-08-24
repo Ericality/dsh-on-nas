@@ -86,13 +86,14 @@ function lastUserQuestion(session) {
 	return "";
 }
 
-/** 本轮最后一个 assistant 文本答复 */
+/** 本轮最后一个 assistant 文本答复 (content 在 data.message.content, 兼容 data.content) */
 function lastAssistantAnswer(session) {
 	const events = session.events;
 	for (let i = events.length - 1; i >= 0; i--) {
 		const e = events[i];
 		if (e.type !== "assistant/message") continue;
-		const blocks = Array.isArray(e.data?.content) ? e.data.content : [];
+		const msg = e.data?.message ?? e.data;
+		const blocks = Array.isArray(msg?.content) ? msg.content : [];
 		const text = blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join("").trim();
 		if (text) return text;
 	}
