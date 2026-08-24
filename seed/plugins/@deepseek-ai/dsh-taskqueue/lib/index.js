@@ -38,6 +38,8 @@ const STATE_FILE = "/data/dsh/taskqueue.json";
 const PRICING_PAGE_URL = "https://api-docs.deepseek.com/zh-cn/quick_start/pricing";
 const WINDOW_CACHE_TTL_MS = 30 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60000;
+// 派发后超过该时长仍未消费(消息丢失)才重派发, 避免和正常执行竞态
+const REDISPATCH_GRACE_MS = 2 * 60 * 1000;
 
 // 内置兜底 (2026-08-23 官方: 周一至周五 9-12/14-18 高峰, 其余空闲)
 const FALLBACK_WINDOWS = { weekdaysOnly: true, windows: [[9, 12], [14, 18]] };
@@ -186,12 +188,33 @@ export async function apply(ctx) {
 			// 派发后在对话中形成可见的记录, 而不是折叠的"上下文注入"灰条。
 			source: { kind: "user" }
 		});
+		task.messageId = message.id; // 记录消息 id, 用于重启后校验消息是否仍存活
 		agent.followup(message);
 		task.status = "dispatched";
 		task.dispatchedAt = new Date().toISOString();
 		const ok = await writeState(state);
 		if (!ok) ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${task.id} 已派发但状态落盘失败, 重启后可能重复派发`);
 		ctx.logger?.info?.(`dsh-taskqueue: 已派发任务 #${task.id} 到 agent ${agent.id}`);
+	}
+
+	/**
+	 * 校验派发消息是否仍存活:
+	 *   - 在 agent 的 inbox 里排队等待消费 -> 存活
+	 *   - 已被 claim 成会话里的 user/message (id 匹配) -> 已消费
+	 *   - 都没有 -> 消息丢失(典型: 派发后未消费就遇到容器重启, dispose 会清空 inbox)
+	 */
+	function isMessageAlive(task, agent) {
+		if (!task.messageId) return true; // 旧任务无 messageId, 不参与校验
+		try {
+			if (agent.inbox?.nextTurn?.some((m) => m.id === task.messageId)) return true;
+			if (agent.inbox?.nextStep?.some((m) => m.id === task.messageId)) return true;
+			const evs = agent.session?.events ?? [];
+			for (let i = evs.length - 1; i >= 0; i--) {
+				const e = evs[i];
+				if (e.type === "user/message" && e.data?.id === task.messageId) return true;
+			}
+		} catch { /* 会话不可读时保守跳过 */ }
+		return false;
 	}
 
 	// 目标会话解析优先级:
@@ -220,11 +243,23 @@ export async function apply(ctx) {
 			const state = await readState();
 			const windowsNow = await resolveWindows();
 			const now = Date.now();
+			// 1) 派发到期任务 (pending)
 			const due = state.tasks.filter((t) => t.status === "pending"
 				&& (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !isBeijingPeak(windowsNow)));
 			for (const task of due) {
 				const agent = await findTargetAgent(state, task);
 				if (!agent) continue; // 该任务无可用会话, 下次再试
+				await dispatchTask(state, task, agent);
+			}
+			// 2) 校验已派发任务: 派发超过 REDISPATCH_GRACE_MS 且消息已丢失(典型:
+			//    派发后未消费就遇容器重启, dispose 清空 inbox) -> 重新派发
+			for (const task of state.tasks) {
+				if (task.status !== "dispatched" || !task.dispatchedAt) continue;
+				if (now - Date.parse(task.dispatchedAt) < REDISPATCH_GRACE_MS) continue;
+				const agent = await findTargetAgent(state, task);
+				if (!agent) continue;
+				if (isMessageAlive(task, agent)) continue;
+				ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${task.id} 派发消息已丢失(可能重启清空 inbox), 重新派发`);
 				await dispatchTask(state, task, agent);
 			}
 		});
