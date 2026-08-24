@@ -218,7 +218,7 @@ export async function apply(ctx) {
 	}
 
 	// 目标会话解析优先级:
-	//   1) 任务创建时的会话 (task.sessionId)
+	//   1) 任务创建时的会话 (task.sessionId), 不在线则尝试 resume 恢复(无人值守也能派发)
 	//   2) /queue target 设置的兜底目标会话 (state.targetSessionId)
 	//   3) 任意在线 agent
 	async function findTargetAgent(state, task) {
@@ -227,6 +227,18 @@ export async function apply(ctx) {
 		if (boundId) {
 			const a = agents.get(boundId);
 			if (a) return a;
+			// 绑定会话不在线: 主动恢复其持久 agent (dsh 重启后不会自动恢复会话,
+			// 不恢复的话低谷任务在无人值守时会一直滞留)
+			try {
+				const handle = await agents.resume?.({ resumeSessionId: boundId });
+				const restored = handle?.agent ?? agents.get(boundId);
+				if (restored) {
+					ctx.logger?.info?.(`dsh-taskqueue: 已恢复会话 ${shortSession(boundId)} 的 agent 用于派发`);
+					return restored;
+				}
+			} catch (e) {
+				ctx.logger?.warn?.(`dsh-taskqueue: 恢复会话 ${shortSession(boundId)} 失败: ${e?.message ?? e}`);
+			}
 		}
 		if (state.targetSessionId && state.targetSessionId !== boundId) {
 			const a = agents.get(state.targetSessionId);
