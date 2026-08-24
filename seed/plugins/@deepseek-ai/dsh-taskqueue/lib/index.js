@@ -275,8 +275,20 @@ export async function apply(ctx) {
 				await writeState(state);
 				return { kind: "success", text: `派发目标会话已设为 ${rest}` };
 			}
+			case "help": case "":
+				return { kind: "success", text: [
+					"/queue add <内容>                   入队, 等低谷自动执行",
+					"/queue add --at \"HH:mm\" <内容>    指定时间执行 (HH:mm 或 YYYY-MM-DD HH:mm)",
+					"/queue list                         查看队列",
+					"/queue cancel <id>                  取消任务",
+					"/queue edit <id> <新内容>           修改任务内容",
+					"/queue run-now <id>                 立即派发(不等低谷)",
+					"/queue target [会话id]              查看/设置派发目标会话",
+					"/queue help                         本帮助",
+					"低谷时段由官方页动态解析(当前: 周一至周五 9-12/14-18 高峰, 其余低谷)"
+				].join("\n") };
 			default:
-				return { kind: "error", text: "用法: /queue add|list|cancel|edit|run-now|target" };
+				return { kind: "error", text: "未知子命令, 用 /queue help 查看用法" };
 			}
 		}
 	});
