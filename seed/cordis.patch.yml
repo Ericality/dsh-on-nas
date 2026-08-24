@@ -15,6 +15,9 @@
     - id: pwa
       name: '@deepseek-ai/dsh-pwa'
 
+    - id: taskqueue
+      name: '@deepseek-ai/dsh-taskqueue'
+
     - id: notify
       name: '@deepseek-ai/dsh-notify'
       config:
