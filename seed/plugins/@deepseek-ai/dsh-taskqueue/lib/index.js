@@ -230,7 +230,24 @@ export async function apply(ctx) {
 			// 绑定会话不在线: 主动恢复其持久 agent (dsh 重启后不会自动恢复会话,
 			// 不恢复的话低谷任务在无人值守时会一直滞留)
 			try {
-				const handle = await agents.resume?.({ resumeSessionId: boundId });
+				// resume 必须带 agentOptions(provider/model) 和 setup(挂载默认 preset):
+				// 否则恢复出来的 agent 没有 preset(standard-fetch) 组合, 工具集只剩插件工具、
+				// 系统提示词 {{model}} 无值, 无法正常执行。与宿主冷恢复路径
+				// (createApiRemoteAgentResolver + composeAgent) 保持一致。
+				const defaultModel = ctx.get?.("agentDefaultModel")?.currentSelection?.() ?? {};
+				const handle = await agents.resume?.({
+					resumeSessionId: boundId,
+					agentOptions: {
+						...(defaultModel.provider ? { provider: defaultModel.provider } : {}),
+						...(defaultModel.model ? { model: defaultModel.model } : {})
+					},
+					setup: async (agentCtx) => {
+						// 挂载部署默认 preset (当前 standard-fetch), 恢复的 agent 才能
+						// 解析到该 preset 的工具集/提示词段; 无 preset 名单时跳过(与宿主一致)。
+						const presets = ctx.get?.("agentPresets");
+						if (presets) await presets.mount(agentCtx);
+					}
+				});
 				const restored = handle?.agent ?? agents.get(boundId);
 				if (restored) {
 					ctx.logger?.info?.(`dsh-taskqueue: 已恢复会话 ${shortSession(boundId)} 的 agent 用于派发`);
