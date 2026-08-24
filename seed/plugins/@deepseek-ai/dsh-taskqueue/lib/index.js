@@ -183,7 +183,9 @@ export async function apply(ctx) {
 
 	async function dispatchTask(state, task, agent) {
 		const message = createUserMessage({
-			content: [{ type: "text", text: `[任务队列] ${task.content}` }],
+			// 消息前加"自动调度任务 #N"提示, 方便在对话里一眼识别出是队列自动派发的
+			// (而非自己手动输入的消息), 并知道是第几号任务。
+			content: [{ type: "text", text: `[任务队列] 【自动调度任务 #${task.id}】 ${task.content}` }],
 			// source.kind="user" 让 GUI 把它渲染成普通用户气泡(与 /goal 插件一致),
 			// 派发后在对话中形成可见的记录, 而不是折叠的"上下文注入"灰条。
 			source: { kind: "user" }
