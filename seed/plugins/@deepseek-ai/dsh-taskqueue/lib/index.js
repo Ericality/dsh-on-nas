@@ -113,6 +113,11 @@ const STATUS_TEXT = {
 	cancelled: "已取消"
 };
 
+/** 列表一行显示用: 压缩连续空白为单空格并去首尾 */
+function oneLine(s) {
+	return String(s ?? "").replace(/\s+/g, " ").trim();
+}
+
 /** 解析 --at 参数: "HH:mm"(下一次) 或 "YYYY-MM-DD HH:mm" */
 function parseAt(value, now = new Date()) {
 	if (!value) return null;
@@ -156,6 +161,24 @@ export async function apply(ctx) {
 	}
 
 	// ---------- 派发 ----------
+	// 派发是"读状态->派发->写状态"的非原子流程, 并发(定时 tick + 手动 run-now)
+	// 时可能基于旧状态互相覆盖, 导致任务被重复派发。用 promise 链把所有派发串行化。
+	let dispatchChain = Promise.resolve();
+	function serialized(fn) {
+		const run = dispatchChain.then(fn, fn);
+		dispatchChain = run.catch(() => {});
+		return run;
+	}
+	/** 串行化的"读状态->改->写盘", 所有会写状态的操作都走这里, 避免并发覆盖 */
+	function mutateState(fn) {
+		return serialized(async () => {
+			const state = await readState();
+			const result = await fn(state);
+			await writeState(state);
+			return result;
+		});
+	}
+
 	async function dispatchTask(state, task, agent) {
 		const message = createUserMessage({
 			content: [{ type: "text", text: `[任务队列] ${task.content}` }],
@@ -166,7 +189,8 @@ export async function apply(ctx) {
 		agent.followup(message);
 		task.status = "dispatched";
 		task.dispatchedAt = new Date().toISOString();
-		await writeState(state);
+		const ok = await writeState(state);
+		if (!ok) ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${task.id} 已派发但状态落盘失败, 重启后可能重复派发`);
 		ctx.logger?.info?.(`dsh-taskqueue: 已派发任务 #${task.id} 到 agent ${agent.id}`);
 	}
 
@@ -192,16 +216,18 @@ export async function apply(ctx) {
 
 	// ---------- 定时检查 ----------
 	async function tick() {
-		const state = await readState();
-		const windowsNow = await resolveWindows();
-		const now = Date.now();
-		const due = state.tasks.filter((t) => t.status === "pending"
-			&& (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !isBeijingPeak(windowsNow)));
-		for (const task of due) {
-			const agent = await findTargetAgent(state, task);
-			if (!agent) continue; // 该任务无可用会话, 下次再试
-			await dispatchTask(state, task, agent);
-		}
+		await serialized(async () => {
+			const state = await readState();
+			const windowsNow = await resolveWindows();
+			const now = Date.now();
+			const due = state.tasks.filter((t) => t.status === "pending"
+				&& (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !isBeijingPeak(windowsNow)));
+			for (const task of due) {
+				const agent = await findTargetAgent(state, task);
+				if (!agent) continue; // 该任务无可用会话, 下次再试
+				await dispatchTask(state, task, agent);
+			}
+		});
 	}
 
 	const timer = setInterval(() => { void tick().catch(() => {}); }, CHECK_INTERVAL_MS);
@@ -215,7 +241,6 @@ export async function apply(ctx) {
 		description: "任务队列: 入队等低谷自动执行 / 指定时间 / 查看修改取消",
 		input: { hint: "add [--at \"HH:mm\"] <内容> | list | cancel <id> | edit <id> <内容> | run-now <id> | target [会话id]" },
 		handler: async (invocation) => {
-			const state = await readState();
 			const sessionId = invocation?.agent?.id ?? null;
 			const raw = (invocation?.rawInput ?? "").trim();
 			const parts = raw.split(/\s+/);
@@ -233,21 +258,22 @@ export async function apply(ctx) {
 				}
 				if (!content) return { kind: "error", text: "用法: /queue add [--at \"HH:mm\"] <内容>" };
 				if (rest.includes("--at") && !at) return { kind: "error", text: "--at 时间格式无效 (HH:mm 或 YYYY-MM-DD HH:mm, 且需为未来)" };
-				const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
-				const task = {
-					id,
-					content,
-					createdAt: new Date().toISOString(),
-					status: "pending",
-					...(sessionId ? { sessionId } : {}),
-					...(at ? { scheduledAt: at } : {})
-				};
-				state.tasks.push(task);
-				await writeState(state);
-				const when = at ? `于 ${beijingNowString(new Date(at))}` : "等低谷时段自动执行";
-				return { kind: "success", text: `任务 #${id} 已入队 (${when}, 派发到当前会话 ${shortSession(sessionId)}): ${content}` };
+				return await mutateState(async (state) => {
+					const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
+					state.tasks.push({
+						id,
+						content,
+						createdAt: new Date().toISOString(),
+						status: "pending",
+						...(sessionId ? { sessionId } : {}),
+						...(at ? { scheduledAt: at } : {})
+					});
+					const when = at ? `于 ${beijingNowString(new Date(at))}` : "等低谷时段自动执行";
+					return { kind: "success", text: `任务 #${id} 已入队 (${when}, 派发到当前会话 ${shortSession(sessionId)}): ${content}` };
+				});
 			}
 			case "list": {
+				const state = await readState();
 				const pending = state.tasks.filter((t) => t.status === "pending");
 				const rest2 = state.tasks.filter((t) => t.status !== "pending");
 				const windowsNow = await resolveWindows();
@@ -258,45 +284,55 @@ export async function apply(ctx) {
 					const when = t.scheduledAt
 						? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
 						: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中");
-					lines.push(`#${t.id} ${t.content.slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
+					lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
 				}
 				for (const t of rest2) {
-					lines.push(`#${t.id} ${t.content.slice(0, 50)} [${STATUS_TEXT[t.status] ?? t.status}]`);
+					lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${STATUS_TEXT[t.status] ?? t.status}]`);
 				}
 				lines.push(`兜底目标: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置"} · 高峰窗口: ${windowSource}`);
 				return { kind: "success", text: lines.join("\n") };
 			}
 			case "cancel": {
 				const id = parseInt(rest, 10);
-				const t = state.tasks.find((x) => x.id === id && x.status === "pending");
-				if (!t) return { kind: "error", text: `未找到排队中的任务 #${id}` };
-				t.status = "cancelled";
-				await writeState(state);
-				return { kind: "success", text: `任务 #${id} 已取消` };
+				if (!Number.isInteger(id)) return { kind: "error", text: "用法: /queue cancel <id>" };
+				return await mutateState(async (state) => {
+					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
+					if (!t) return { kind: "error", text: `未找到排队中的任务 #${id}` };
+					t.status = "cancelled";
+					return { kind: "success", text: `任务 #${id} 已取消` };
+				});
 			}
 			case "edit": {
 				const m = /^(\d+)\s+(.+)$/.exec(rest);
 				if (!m) return { kind: "error", text: "用法: /queue edit <id> <新内容>" };
-				const t = state.tasks.find((x) => x.id === parseInt(m[1], 10) && x.status === "pending");
-				if (!t) return { kind: "error", text: `未找到排队中的任务 #${m[1]}` };
-				t.content = m[2];
-				await writeState(state);
-				return { kind: "success", text: `任务 #${t.id} 内容已更新: ${t.content}` };
+				return await mutateState(async (state) => {
+					const t = state.tasks.find((x) => x.id === parseInt(m[1], 10) && x.status === "pending");
+					if (!t) return { kind: "error", text: `未找到排队中的任务 #${m[1]}` };
+					t.content = m[2];
+					return { kind: "success", text: `任务 #${t.id} 内容已更新: ${t.content}` };
+				});
 			}
 			case "run-now": {
 				const id = parseInt(rest, 10);
-				const t = state.tasks.find((x) => x.id === id && x.status === "pending");
-				if (!t) return { kind: "error", text: `未找到排队中的任务 #${id}` };
-				const agent = await findTargetAgent(state, t);
-				if (!agent) return { kind: "error", text: "任务绑定会话已离线且无兜底会话, 稍后再试" };
-				await dispatchTask(state, t, agent);
-				return { kind: "success", text: `任务 #${id} 已立即派发到 ${shortSession(agent.id)}` };
+				if (!Number.isInteger(id)) return { kind: "error", text: "用法: /queue run-now <id>" };
+				return await mutateState(async (state) => {
+					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
+					if (!t) return { kind: "error", text: `未找到排队中的任务 #${id}` };
+					const agent = await findTargetAgent(state, t);
+					if (!agent) return { kind: "error", text: "任务绑定会话已离线且无兜底会话, 稍后再试" };
+					await dispatchTask(state, t, agent);
+					return { kind: "success", text: `任务 #${id} 已立即派发到 ${shortSession(agent.id)}` };
+				});
 			}
 			case "target": {
-				if (!rest) return { kind: "success", text: `兜底派发目标会话: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置(任务默认派发回创建它的会话)"}` };
-				state.targetSessionId = rest;
-				await writeState(state);
-				return { kind: "success", text: `兜底派发目标会话已设为 ${rest}` };
+				if (!rest) {
+					const state = await readState();
+					return { kind: "success", text: `兜底派发目标会话: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置(任务默认派发回创建它的会话)"}` };
+				}
+				return await mutateState(async (state) => {
+					state.targetSessionId = rest;
+					return { kind: "success", text: `兜底派发目标会话已设为 ${rest}` };
+				});
 			}
 			case "help": case "":
 				return { kind: "success", text: [
@@ -336,19 +372,19 @@ export async function apply(ctx) {
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
 		execute: async (args, exec) => {
-			const state = await readState();
 			const sessionId = exec?.agent?.id ?? null;
 			const at = args.at ? parseAt(args.at) : null;
 			if (args.at && !at) throw new Error("at 时间格式无效 (HH:mm 或 YYYY-MM-DD HH:mm, 且需为未来)");
-			const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
-			state.tasks.push({
-				id, content: args.content, createdAt: new Date().toISOString(), status: "pending",
-				...(sessionId ? { sessionId } : {}),
-				...(at ? { scheduledAt: at } : {})
+			return await mutateState(async (state) => {
+				const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
+				state.tasks.push({
+					id, content: args.content, createdAt: new Date().toISOString(), status: "pending",
+					...(sessionId ? { sessionId } : {}),
+					...(at ? { scheduledAt: at } : {})
+				});
+				const when = at ? `于 ${beijingNowString(new Date(at))}` : "等低谷时段自动执行";
+				return { id, text: `任务 #${id} 已入队 (${when}, 派发回当前会话 ${shortSession(sessionId)}): ${args.content}` };
 			});
-			await writeState(state);
-			const when = at ? `于 ${beijingNowString(new Date(at))}` : "等低谷时段自动执行";
-			return { id, text: `任务 #${id} 已入队 (${when}, 派发回当前会话 ${shortSession(sessionId)}): ${args.content}` };
 		},
 		presentCall: (args) => ({ card: "generic", title: "加入任务队列", kind: "other", rawInput: args })
 	}));
@@ -378,11 +414,11 @@ export async function apply(ctx) {
 				const when = t.scheduledAt
 					? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
 					: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中");
-				lines.push(`#${t.id} ${t.content.slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
+				lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
 			}
 			const done = state.tasks.filter((t) => t.status !== "pending");
 			for (const t of done) {
-				lines.push(`#${t.id} ${t.content.slice(0, 50)} [${STATUS_TEXT[t.status] ?? t.status}]`);
+				lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${STATUS_TEXT[t.status] ?? t.status}]`);
 			}
 			lines.push(`兜底目标: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置"} · 高峰窗口: ${windowSource}`);
 			return { text: lines.join("\n") };
@@ -399,12 +435,12 @@ export async function apply(ctx) {
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
 		execute: async (args) => {
-			const state = await readState();
-			const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
-			if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
-			t.status = "cancelled";
-			await writeState(state);
-			return { text: `任务 #${args.id} 已取消` };
+			return await mutateState(async (state) => {
+				const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
+				if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
+				t.status = "cancelled";
+				return { text: `任务 #${args.id} 已取消` };
+			});
 		},
 		presentCall: (args) => ({ card: "generic", title: "取消任务", kind: "other", rawInput: args })
 	}));
@@ -421,12 +457,12 @@ export async function apply(ctx) {
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
 		execute: async (args) => {
-			const state = await readState();
-			const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
-			if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
-			t.content = args.content;
-			await writeState(state);
-			return { text: `任务 #${t.id} 内容已更新: ${t.content}` };
+			return await mutateState(async (state) => {
+				const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
+				if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
+				t.content = args.content;
+				return { text: `任务 #${t.id} 内容已更新: ${t.content}` };
+			});
 		},
 		presentCall: (args) => ({ card: "generic", title: "修改任务", kind: "other", rawInput: args })
 	}));
@@ -440,13 +476,14 @@ export async function apply(ctx) {
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
 		execute: async (args) => {
-			const state = await readState();
-			const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
-			if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
-			const agent = await findTargetAgent(state, t);
-			if (!agent) return { text: `任务 #${t.id} 绑定会话已离线且无兜底会话, 保持排队` };
-			await dispatchTask(state, t, agent);
-			return { text: `任务 #${t.id} 已立即派发到 ${shortSession(agent.id)}` };
+			return await mutateState(async (state) => {
+				const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
+				if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
+				const agent = await findTargetAgent(state, t);
+				if (!agent) return { text: `任务 #${t.id} 绑定会话已离线且无兜底会话, 保持排队` };
+				await dispatchTask(state, t, agent);
+				return { text: `任务 #${t.id} 已立即派发到 ${shortSession(agent.id)}` };
+			});
 		},
 		presentCall: (args) => ({ card: "generic", title: "立即派发任务", kind: "other", rawInput: args })
 	}));
