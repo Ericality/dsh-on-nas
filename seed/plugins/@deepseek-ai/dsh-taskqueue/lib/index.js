@@ -256,11 +256,13 @@ export async function apply(ctx) {
 				if (pending.length === 0) lines.push("(队列为空)");
 				for (const t of pending) {
 					const when = t.scheduledAt
-						? `定于 ${beijingNowString(new Date(t.scheduledAt))}`
-						: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中, 将尽快派发");
-					lines.push(`#${t.id} [${when}]${t.sessionId ? ` (绑定 ${shortSession(t.sessionId)})` : ""} ${t.content.slice(0, 60)}`);
+						? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
+						: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中");
+					lines.push(`#${t.id} ${t.content.slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
 				}
-				if (rest2.length > 0) lines.push(`-- 历史: ${rest2.map((t) => `#${t.id}${STATUS_TEXT[t.status] ?? t.status}`).join(", ")}`);
+				for (const t of rest2) {
+					lines.push(`#${t.id} ${t.content.slice(0, 50)} [${STATUS_TEXT[t.status] ?? t.status}]`);
+				}
 				lines.push(`兜底目标: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置"} · 高峰窗口: ${windowSource}`);
 				return { kind: "success", text: lines.join("\n") };
 			}
@@ -374,12 +376,14 @@ export async function apply(ctx) {
 			if (pending.length === 0) lines.push("(队列为空)");
 			for (const t of pending) {
 				const when = t.scheduledAt
-					? `定于 ${beijingNowString(new Date(t.scheduledAt))}`
-					: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中, 将尽快派发");
-				lines.push(`#${t.id} [${when}]${t.sessionId ? ` (绑定 ${shortSession(t.sessionId)})` : ""} ${t.content.slice(0, 60)}`);
+					? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
+					: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中");
+				lines.push(`#${t.id} ${t.content.slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
 			}
 			const done = state.tasks.filter((t) => t.status !== "pending");
-			if (done.length > 0) lines.push(`-- 历史: ${done.map((t) => `#${t.id}${STATUS_TEXT[t.status] ?? t.status}`).join(", ")}`);
+			for (const t of done) {
+				lines.push(`#${t.id} ${t.content.slice(0, 50)} [${STATUS_TEXT[t.status] ?? t.status}]`);
+			}
 			lines.push(`兜底目标: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置"} · 高峰窗口: ${windowSource}`);
 			return { text: lines.join("\n") };
 		},

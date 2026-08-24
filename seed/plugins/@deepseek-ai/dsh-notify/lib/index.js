@@ -12,6 +12,9 @@ import { appendFileSync } from "node:fs";
  * 避免聊天短回复刷屏) 才推送。配置见 profile patch 的 notify 行;
  * 也支持环境变量 DSH_BARK_KEYS(逗号分隔) / DSH_SYNOLOGY_WEBHOOK_URL。
  *
+ * 内容 (v0.2.0): 通知里带上会话标题、本轮用户问题摘要、agent 答复摘要,
+ * 方便不看 GUI 也能知道是哪个会话、聊了什么。
+ *
  * 附带命令 /notify-test 用于验证各通道。
  * 通知发送是 fire-and-forget, 失败只记日志, 不影响任务。
  */
@@ -62,6 +65,40 @@ const fmtElapsed = (ms) => {
 	return `${Math.floor(s / 60)} 分 ${s % 60} 秒`;
 };
 
+const clip = (s, n) => (s.length > n ? `${s.slice(0, n)}…` : s);
+
+/** 最近一次会话标题 (session/title 事件), 无则空串 */
+function sessionTitle(session) {
+	const ev = session.events.findLast((e) => e.type === "session/title" && typeof e.data?.title === "string");
+	return ev?.data?.title ?? "";
+}
+
+/** 本轮最后一个真实用户消息 (source.kind="user") 的文本 */
+function lastUserQuestion(session) {
+	const events = session.events;
+	for (let i = events.length - 1; i >= 0; i--) {
+		const e = events[i];
+		if (e.type !== "user/message") continue;
+		if (e.data?.source?.kind !== "user") continue;
+		const block = e.data?.content?.[0];
+		if (block?.type === "text" && typeof block.text === "string" && block.text.trim()) return block.text.trim();
+	}
+	return "";
+}
+
+/** 本轮最后一个 assistant 文本答复 */
+function lastAssistantAnswer(session) {
+	const events = session.events;
+	for (let i = events.length - 1; i >= 0; i--) {
+		const e = events[i];
+		if (e.type !== "assistant/message") continue;
+		const blocks = Array.isArray(e.data?.content) ? e.data.content : [];
+		const text = blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join("").trim();
+		if (text) return text;
+	}
+	return "";
+}
+
 const DEBUG_LOG = "/workspace/notify-debug.log";
 function debug(msg) {
 	try { appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ${msg}\n`); } catch { /* ignore */ }
@@ -78,7 +115,7 @@ export async function apply(ctx, config) {
 	const hasChannel = barkKeys.length > 0 || synologyUrl !== "";
 
 	async function notify(title, body) {
-		const text = `${title} ${body}`;
+		const text = `${title}\n${body}`;
 		const results = await Promise.allSettled([
 			...barkKeys.map((key) => sendBark(key, title, body)),
 			...synologyUrl ? [sendSynology(synologyUrl, text)] : []
@@ -117,9 +154,14 @@ export async function apply(ctx, config) {
 				: "unknown";
 		const sid = String(session.id ?? "");
 		const sidShort = sid.startsWith("session-") ? sid.slice(8, 16) : sid.slice(0, 8);
-		const title = "DSH 任务完成";
-		const body = `回合 #${turn} 完成 (用时 ${fmtElapsed(elapsed)}) · 原因: ${reasonText} · 会话 ${sidShort}`;
-		void notify(title, body);
+		const q = lastUserQuestion(session);
+		const a = lastAssistantAnswer(session);
+		const title = `DSH 任务完成 · ${sessionTitle(session) || "会话"}`;
+		const lines = [];
+		if (q) lines.push(`❓ ${clip(q, 60)}`);
+		if (a) lines.push(`🤖 ${clip(a, 100)}`);
+		lines.push(`回合 #${turn} 完成 (用时 ${fmtElapsed(elapsed)}) · 原因: ${reasonText} · 会话 ${sidShort}`);
+		void notify(title, lines.join("\n"));
 	});
 
 	// 验证命令
