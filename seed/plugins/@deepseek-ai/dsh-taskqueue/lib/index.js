@@ -14,8 +14,13 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
  * (当前: 周一至周五 9-12/14-18 为高峰, 其余空闲), 缓存 30 分钟;
  * 解析失败回退内置定义。官方调整时段会自动跟随。
  *
- * 派发: 通过 agent.followup 把任务文本作为 user message 投递到目标会话
- * (默认: 最后一个使用 /queue 命令的会话), agent 空闲后执行。
+ * 会话绑定: 每个任务在创建时记录所在会话(sessionId)。派发时优先投递回
+ * 创建它的会话(该会话离线时按 /queue target 设置的兜底目标, 再退到任意
+ * 在线会话), 因此不同会话创建的任务会派发到各自会话继续。
+ *
+ * 派发: 通过 agent.followup 把任务文本作为 user message(source.kind="user",
+ * 与 /goal 插件一致)投递到目标会话, 在对话中显示为一条普通用户消息记录,
+ * agent 空闲后执行。
  *
  * 斜杠命令:
  *   /queue add <内容>                   入队, 等低谷自动执行
@@ -24,7 +29,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
  *   /queue cancel <id>                  取消
  *   /queue edit <id> <新内容>           修改内容
  *   /queue run-now <id>                 立即执行
- *   /queue target [会话id]              查看/设置派发目标会话
+ *   /queue target [会话id]              查看/设置兜底派发目标会话
  */
 export const name = "dsh-taskqueue";
 export const inject = ["commands", "agents", "tools"];
@@ -77,12 +82,19 @@ function beijingNowString(now = new Date()) {
 	return new Date(now.getTime() + 8 * 3600 * 1000).toISOString().replace("T", " ").slice(0, 16);
 }
 
+/** 会话 id 短显示: session-xxxxxxxx */
+function shortSession(id) {
+	if (!id) return "未绑定";
+	const m = /^session-([0-9a-f]{8})/.exec(id);
+	return m ? `session-${m[1]}` : id.slice(0, 16);
+}
+
 // ---------- 状态持久化 ----------
 async function readState() {
 	try {
 		return JSON.parse(await readFile(STATE_FILE, "utf8"));
 	} catch {
-		return { version: 1, targetSessionId: null, tasks: [] };
+		return { version: 2, targetSessionId: null, tasks: [] };
 	}
 }
 
@@ -147,7 +159,9 @@ export async function apply(ctx) {
 	async function dispatchTask(state, task, agent) {
 		const message = createUserMessage({
 			content: [{ type: "text", text: `[任务队列] ${task.content}` }],
-			source: { kind: "plugin", plugin: "taskqueue" }
+			// source.kind="user" 让 GUI 把它渲染成普通用户气泡(与 /goal 插件一致),
+			// 派发后在对话中形成可见的记录, 而不是折叠的"上下文注入"灰条。
+			source: { kind: "user" }
 		});
 		agent.followup(message);
 		task.status = "dispatched";
@@ -156,9 +170,18 @@ export async function apply(ctx) {
 		ctx.logger?.info?.(`dsh-taskqueue: 已派发任务 #${task.id} 到 agent ${agent.id}`);
 	}
 
-	async function findTargetAgent(state) {
+	// 目标会话解析优先级:
+	//   1) 任务创建时的会话 (task.sessionId)
+	//   2) /queue target 设置的兜底目标会话 (state.targetSessionId)
+	//   3) 任意在线 agent
+	async function findTargetAgent(state, task) {
 		const agents = ctx.agents;
-		if (state.targetSessionId) {
+		const boundId = task?.sessionId ?? state.targetSessionId;
+		if (boundId) {
+			const a = agents.get(boundId);
+			if (a) return a;
+		}
+		if (state.targetSessionId && state.targetSessionId !== boundId) {
 			const a = agents.get(state.targetSessionId);
 			if (a) return a;
 		}
@@ -174,10 +197,11 @@ export async function apply(ctx) {
 		const now = Date.now();
 		const due = state.tasks.filter((t) => t.status === "pending"
 			&& (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !isBeijingPeak(windowsNow)));
-		if (due.length === 0) return;
-		const agent = await findTargetAgent(state);
-		if (!agent) return; // 无在线会话, 下次再试
-		for (const task of due) await dispatchTask(state, task, agent);
+		for (const task of due) {
+			const agent = await findTargetAgent(state, task);
+			if (!agent) continue; // 该任务无可用会话, 下次再试
+			await dispatchTask(state, task, agent);
+		}
 	}
 
 	const timer = setInterval(() => { void tick().catch(() => {}); }, CHECK_INTERVAL_MS);
@@ -192,11 +216,7 @@ export async function apply(ctx) {
 		input: { hint: "add [--at \"HH:mm\"] <内容> | list | cancel <id> | edit <id> <内容> | run-now <id> | target [会话id]" },
 		handler: async (invocation) => {
 			const state = await readState();
-			// 自动固定派发目标 = 使用命令的会话
-			if (!state.targetSessionId && invocation?.agent?.id) {
-				state.targetSessionId = invocation.agent.id;
-				await writeState(state);
-			}
+			const sessionId = invocation?.agent?.id ?? null;
 			const raw = (invocation?.rawInput ?? "").trim();
 			const parts = raw.split(/\s+/);
 			const sub = (parts[0] ?? "").toLowerCase();
@@ -219,12 +239,13 @@ export async function apply(ctx) {
 					content,
 					createdAt: new Date().toISOString(),
 					status: "pending",
+					...(sessionId ? { sessionId } : {}),
 					...(at ? { scheduledAt: at } : {})
 				};
 				state.tasks.push(task);
 				await writeState(state);
 				const when = at ? `于 ${beijingNowString(new Date(at))}` : "等低谷时段自动执行";
-				return { kind: "success", text: `任务 #${id} 已入队 (${when}): ${content}` };
+				return { kind: "success", text: `任务 #${id} 已入队 (${when}, 派发到当前会话 ${shortSession(sessionId)}): ${content}` };
 			}
 			case "list": {
 				const pending = state.tasks.filter((t) => t.status === "pending");
@@ -237,10 +258,10 @@ export async function apply(ctx) {
 					const when = t.scheduledAt
 						? `定于 ${beijingNowString(new Date(t.scheduledAt))}`
 						: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中, 将尽快派发");
-					lines.push(`#${t.id} [${when}] ${t.content.slice(0, 60)}`);
+					lines.push(`#${t.id} [${when}]${t.sessionId ? ` (绑定 ${shortSession(t.sessionId)})` : ""} ${t.content.slice(0, 60)}`);
 				}
 				if (rest2.length > 0) lines.push(`-- 历史: ${rest2.map((t) => `#${t.id}${STATUS_TEXT[t.status] ?? t.status}`).join(", ")}`);
-				lines.push(`目标会话: ${state.targetSessionId ?? "未固定"} · 高峰窗口: ${windowSource}`);
+				lines.push(`兜底目标: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置"} · 高峰窗口: ${windowSource}`);
 				return { kind: "success", text: lines.join("\n") };
 			}
 			case "cancel": {
@@ -264,26 +285,26 @@ export async function apply(ctx) {
 				const id = parseInt(rest, 10);
 				const t = state.tasks.find((x) => x.id === id && x.status === "pending");
 				if (!t) return { kind: "error", text: `未找到排队中的任务 #${id}` };
-				const agent = await findTargetAgent(state);
-				if (!agent) return { kind: "error", text: "当前无在线会话可派发, 稍后再试" };
+				const agent = await findTargetAgent(state, t);
+				if (!agent) return { kind: "error", text: "任务绑定会话已离线且无兜底会话, 稍后再试" };
 				await dispatchTask(state, t, agent);
-				return { kind: "success", text: `任务 #${id} 已立即派发` };
+				return { kind: "success", text: `任务 #${id} 已立即派发到 ${shortSession(agent.id)}` };
 			}
 			case "target": {
-				if (!rest) return { kind: "success", text: `派发目标会话: ${state.targetSessionId ?? "未固定(默认用当前会话)"}` };
+				if (!rest) return { kind: "success", text: `兜底派发目标会话: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置(任务默认派发回创建它的会话)"}` };
 				state.targetSessionId = rest;
 				await writeState(state);
-				return { kind: "success", text: `派发目标会话已设为 ${rest}` };
+				return { kind: "success", text: `兜底派发目标会话已设为 ${rest}` };
 			}
 			case "help": case "":
 				return { kind: "success", text: [
-					"/queue add <内容>                   入队, 等低谷自动执行",
+					"/queue add <内容>                   入队, 派发回当前会话, 等低谷自动执行",
 					"/queue add --at \"HH:mm\" <内容>    指定时间执行 (HH:mm 或 YYYY-MM-DD HH:mm)",
-					"/queue list                         查看队列",
+					"/queue list                         查看队列(含各任务绑定会话)",
 					"/queue cancel <id>                  取消任务",
 					"/queue edit <id> <新内容>           修改任务内容",
 					"/queue run-now <id>                 立即派发(不等低谷)",
-					"/queue target [会话id]              查看/设置派发目标会话",
+					"/queue target [会话id]              查看/设置兜底派发目标会话",
 					"/queue help                         本帮助",
 					"低谷时段由官方页动态解析(当前: 周一至周五 9-12/14-18 高峰, 其余低谷)"
 				].join("\n") };
@@ -296,7 +317,7 @@ export async function apply(ctx) {
 	// ---------- 模型工具 (不依赖客户端斜杠命令, 自然语言即可调用) ----------
 	ctx.tools.register(defineTool({
 		name: "queue_add",
-		description: "把任务加入低谷时段任务队列: 默认等官方低谷价时段(动态解析官方页)自动派发执行, 也可用 at 指定时间(北京时区 HH:mm 或 YYYY-MM-DD HH:mm)",
+		description: "把任务加入低谷时段任务队列: 默认等官方低谷价时段(动态解析官方页)自动派发回当前会话执行, 也可用 at 指定时间(北京时区 HH:mm 或 YYYY-MM-DD HH:mm)",
 		parameters: {
 			content: { type: "string", required: true, description: "任务内容" },
 			at: { type: "string", description: "可选指定时间: HH:mm 或 YYYY-MM-DD HH:mm (北京时区)" }
@@ -314,27 +335,25 @@ export async function apply(ctx) {
 		},
 		execute: async (args, exec) => {
 			const state = await readState();
-			if (!state.targetSessionId && exec?.agent?.id) {
-				state.targetSessionId = exec.agent.id;
-				await writeState(state);
-			}
+			const sessionId = exec?.agent?.id ?? null;
 			const at = args.at ? parseAt(args.at) : null;
 			if (args.at && !at) throw new Error("at 时间格式无效 (HH:mm 或 YYYY-MM-DD HH:mm, 且需为未来)");
 			const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
 			state.tasks.push({
 				id, content: args.content, createdAt: new Date().toISOString(), status: "pending",
+				...(sessionId ? { sessionId } : {}),
 				...(at ? { scheduledAt: at } : {})
 			});
 			await writeState(state);
 			const when = at ? `于 ${beijingNowString(new Date(at))}` : "等低谷时段自动执行";
-			return { id, text: `任务 #${id} 已入队 (${when}): ${args.content}` };
+			return { id, text: `任务 #${id} 已入队 (${when}, 派发回当前会话 ${shortSession(sessionId)}): ${args.content}` };
 		},
 		presentCall: (args) => ({ card: "generic", title: "加入任务队列", kind: "other", rawInput: args })
 	}));
 
 	ctx.tools.register(defineTool({
 		name: "queue_list",
-		description: "查看任务队列(排队中任务/历史/目标会话/当前高峰窗口来源)",
+		description: "查看任务队列(排队中任务及各自绑定会话/历史/兜底目标会话/当前高峰窗口来源)",
 		parameters: {},
 		output: {
 			schema: {
@@ -357,11 +376,11 @@ export async function apply(ctx) {
 				const when = t.scheduledAt
 					? `定于 ${beijingNowString(new Date(t.scheduledAt))}`
 					: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中, 将尽快派发");
-				lines.push(`#${t.id} [${when}] ${t.content.slice(0, 60)}`);
+				lines.push(`#${t.id} [${when}]${t.sessionId ? ` (绑定 ${shortSession(t.sessionId)})` : ""} ${t.content.slice(0, 60)}`);
 			}
 			const done = state.tasks.filter((t) => t.status !== "pending");
 			if (done.length > 0) lines.push(`-- 历史: ${done.map((t) => `#${t.id}${STATUS_TEXT[t.status] ?? t.status}`).join(", ")}`);
-			lines.push(`目标会话: ${state.targetSessionId ?? "未固定"} · 高峰窗口: ${windowSource}`);
+			lines.push(`兜底目标: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置"} · 高峰窗口: ${windowSource}`);
 			return { text: lines.join("\n") };
 		},
 		presentCall: () => ({ card: "generic", title: "查看任务队列", kind: "other" })
@@ -410,19 +429,20 @@ export async function apply(ctx) {
 
 	ctx.tools.register(defineTool({
 		name: "queue_runnow",
-		description: "立即派发排队中的任务(不等低谷时段, 按 id)",
+		description: "立即派发排队中的任务(不等低谷时段, 按 id, 派发回任务绑定会话)",
 		parameters: { id: { type: "integer", required: true, description: "任务 id" } },
 		output: {
 			schema: { type: "object", additionalProperties: false, properties: { text: { type: "string", required: true } } },
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
-		execute: async (args, exec) => {
+		execute: async (args) => {
 			const state = await readState();
 			const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
 			if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
-			if (exec?.agent) await dispatchTask(state, t, exec.agent);
-			else return { text: `任务 #${t.id} 已标记待派发(当前无会话)` };
-			return { text: `任务 #${t.id} 已立即派发` };
+			const agent = await findTargetAgent(state, t);
+			if (!agent) return { text: `任务 #${t.id} 绑定会话已离线且无兜底会话, 保持排队` };
+			await dispatchTask(state, t, agent);
+			return { text: `任务 #${t.id} 已立即派发到 ${shortSession(agent.id)}` };
 		},
 		presentCall: (args) => ({ card: "generic", title: "立即派发任务", kind: "other", rawInput: args })
 	}));
