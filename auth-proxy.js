@@ -261,6 +261,14 @@ const handler = (req, res) => {
     return;
   }
 
+  // PWA 静态资源免登录: manifest/图标/favicon 必须无 Cookie 也能获取
+  // (iOS 添加到主屏幕/浏览器抓 favicon 时通常不带会话 Cookie, 拦截会导致图标加载失败)
+  const PUBLIC_PATHS = ['/manifest.webmanifest', '/apple-touch-icon.png', '/dsh-icon-512.png', '/favicon.svg', '/favicon.ico'];
+  if (PUBLIC_PATHS.some((p) => url.pathname === p || url.pathname.startsWith(p))) {
+    proxy(req, res);
+    return;
+  }
+
   // 其余路径: 校验会话
   const session = readCookie(req);
   if (!session) {

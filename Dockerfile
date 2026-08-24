@@ -48,6 +48,7 @@ RUN npm install --global --no-audit --no-fund --registry="${NPM_REGISTRY}" "@dee
 
 COPY entrypoint.sh /usr/local/bin/dsh-entrypoint
 COPY auth-proxy.js /usr/local/lib/dsh-auth-proxy.js
+COPY seed/ /opt/dsh-seed/
 RUN sed -i 's/\r$//' /usr/local/bin/dsh-entrypoint \
     && chmod 0755 /usr/local/bin/dsh-entrypoint \
     && mkdir -p /data/dsh /workspace

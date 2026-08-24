@@ -1,0 +1,12 @@
+{
+  "name": "@deepseek-ai/dsh-fileserve",
+  "version": "0.1.0",
+  "description": "Serve workspace files as text over HTTP for new-tab viewing (local helper plugin, not an official package)",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "BSD-3-Clause"
+}

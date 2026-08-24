@@ -1,0 +1,12 @@
+{
+  "name": "@deepseek-ai/dsh-pwa",
+  "version": "0.1.0",
+  "description": "iOS Safari PWA install support: apple-touch-icon + standalone manifest + home-screen meta tags (local helper plugin, not an official package)",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "license": "BSD-3-Clause"
+}

@@ -5,6 +5,30 @@
 #               浏览器首次访问点一次"继续前往"; HTTPS 是安全上下文, UI 才能用)
 set -eu
 
+# ---- 可选: 首次启动释放本地自定义插件 (DSH_DEPLOY_PLUGINS=1 才启用) ----
+# 默认不释放; 配置为 1 时只在第一次启动时"只补不覆盖"地播种进 /data/dsh,
+# 之后重启由 .seeded 标记跳过, 不会动已有数据。
+# 涉及密钥的插件 (notify 群晖 webhook 等) 需在播种后到配置文件里填写才生效,
+# 详见 /workspace/docs/插件部署手册.md 与 seed/cordis.patch.yml 注释。
+if [ "${DSH_DEPLOY_PLUGINS:-0}" = "1" ] && [ -d /opt/dsh-seed ] && [ ! -f /data/dsh/.seeded ]; then
+  echo ">> DSH_DEPLOY_PLUGINS=1: 首次释放本地插件与配置 ..."
+  # 注意顺序: 必须先落地插件包和 patch, 再初始化 profile —— 初始化只会生成
+  # 空 patch, 而 cp -n 不会覆盖已存在文件, 顺序反了 seed 的 patch 会被跳过。
+  mkdir -p /data/dsh/profiles/web/node_modules/@deepseek-ai
+  cp -rn /opt/dsh-seed/plugins/@deepseek-ai/* /data/dsh/profiles/web/node_modules/@deepseek-ai/ 2>/dev/null || true
+  cp -rn /opt/dsh-seed/cordis.patch.yml /data/dsh/profiles/web/ 2>/dev/null || true
+  cp -rn /opt/dsh-seed/settings.yaml    /data/dsh/ 2>/dev/null || true
+  cp -rn /opt/dsh-seed/.agent-presets   /data/dsh/ 2>/dev/null || true
+  cp -rn /opt/dsh-seed/AGENTS.md        /data/dsh/ 2>/dev/null || true
+  cp -rn /opt/dsh-seed/ENV.md.template  /workspace/ENV.md 2>/dev/null || true
+  cp -rn /opt/dsh-seed/assets           /workspace/ 2>/dev/null || true
+  cp -rn /opt/dsh-seed/rescue           /data/dsh/ 2>/dev/null || true
+  # 初始化 web profile (生成 cordis.yml/package.json 等; 已存在的 patch 不会被覆盖)
+  dsh --profile web --dump-config >/dev/null 2>&1 || true
+  touch /data/dsh/.seeded
+  echo ">> 播种完成 (标记 /data/dsh/.seeded, 后续重启不再释放)"
+fi
+
 # dsh web 只监听回环 (官方禁止 0.0.0.0), 端口 3081 避免与对外端口冲突
 dsh web --port 3081 &
 dsh_pid=$!

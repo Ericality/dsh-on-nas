@@ -1,0 +1,26 @@
+# 自定义插件 profile patch (seed 模板)
+# 注意: 涉及密钥的配置(群晖 webhook)不在此文件, 部署后按下面注释填写才会生效。
+- insert:
+    - id: web-fetch-http
+      name: '@deepseek-ai/dsh-web-fetch-http'
+      config:
+        timeoutMs: 60000
+
+    - id: fileserve
+      name: '@deepseek-ai/dsh-fileserve'
+
+    - id: balance
+      name: '@deepseek-ai/dsh-balance'
+
+    - id: pwa
+      name: '@deepseek-ai/dsh-pwa'
+
+    - id: notify
+      name: '@deepseek-ai/dsh-notify'
+      config:
+        minTurnMs: 10000
+        # 密钥配置: 部署后取消注释并填入你的群晖 Chat webhook URL 才会启用推送
+        # (或设置环境变量 DSH_SYNOLOGY_WEBHOOK_URL 等效)
+        # synologyWebhookUrl: 'https://<你的群晖>/webapi/entry.cgi?api=SYNO.Chat.External&method=incoming&version=2&token=%22<你的TOKEN>%22'
+        # 可选: Bark 多设备
+        # barkKeys: ['<你的Bark Key>']

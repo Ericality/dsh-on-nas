@@ -1,0 +1,4 @@
+permission:
+  defaultPreset: danger-full-access
+agent-presets:
+  default: standard-fetch

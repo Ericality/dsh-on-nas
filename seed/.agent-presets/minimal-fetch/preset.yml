@@ -1,0 +1,3 @@
+name: 极简模式（含指令注入）
+description: 极简模式的副本（bash + str_replace_editor），额外注入 ENV.md/AGENTS.md 环境指令。
+order: 3.5

@@ -18,6 +18,8 @@ services:
       # 原因: dsh 前端用 crypto.randomUUID, 浏览器只在 HTTPS/localhost 提供
       HTTPS_ACCESS_HOST: "${HTTPS_ACCESS_HOST}"
       DSH_TELEMETRY_DISABLED: "1"
+      # 设为 1: 首次启动释放本地自定义插件(文件服务/余额/PWA/通知等, 默认不释放)
+      DSH_DEPLOY_PLUGINS: "${DSH_DEPLOY_PLUGINS:-0}"
       # 可选: DSH_SESSION_DAYS: "7"   会话有效期天数
       # 可选: DSH_AUTH_DEBUG: "1"     登录调试日志
     volumes:

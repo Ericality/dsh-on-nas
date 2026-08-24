@@ -75,7 +75,33 @@ DSH_AUTH_PASSWORD=足够长的独立密码(至少12位)
 HTTPS_ACCESS_HOST=192.168.1.100     # NAS 局域网 IP 或域名, 用于 8443 自签名证书
 DSH_DATA_PATH=/实际路径/.../data     # 数据目录 (含对话记录)
 WORKSPACE_PATH=/实际路径/.../workspace
+DSH_DEPLOY_PLUGINS=0                 # 可选: 1 = 首次启动释放本地自定义插件(默认不释放)
 ```
+
+## 自定义插件(可选, 默认不释放)
+
+镜像内置 5 个本地自定义插件(与官方 dsh 无冲突, 均为持久卷内的本地包):
+
+| 插件 | 作用 |
+|---|---|
+| `web-fetch-http` | 给模型启用 `web_fetch` 网页抓取 |
+| `fileserve` | `/files/<路径>` 只读文本服务, 聊天里点链接新标签页查看产物 |
+| `balance` | `/balance` + `/balance-detail` 余额/用量/费用(定价自动解析官方页) |
+| `pwa` | iOS Safari 添加到主屏幕(manifest/图标/meta 注入) |
+| `notify` | 回合>10s 完成时推送通知(群晖 Chat / Bark) |
+
+**释放方式**: 设 `DSH_DEPLOY_PLUGINS=1` 后首次启动, entrypoint 会把 `/opt/dsh-seed/`
+"只补不覆盖"地播种进 `/data/dsh`(插件包 + 配置模板 + 救急包), 并写入
+`/data/dsh/.seeded` 标记——**之后重启不再释放, 不会动已有数据**。
+
+**涉及密钥的插件需要部署后手动配置才生效**:
+- `notify` 的群晖 webhook / Bark key 不会出现在默认配置里; 释放后编辑
+  `/data/dsh/profiles/web/cordis.patch.yml` 的 `notify` 行填入(或设环境变量
+  `DSH_SYNOLOGY_WEBHOOK_URL`), 填了才会推送;
+- 完整说明见 [`docs/插件部署手册.md`](docs/插件部署手册.md)(脱敏版)。
+
+**安全提示**: seed 内不含任何密钥(GitHub PAT / API Key / webhook token 均以占位符
+提供, `ENV.md.template` 首次释放后需手工补全)。
 
 ## 配置项
 
@@ -85,6 +111,8 @@ WORKSPACE_PATH=/实际路径/.../workspace
 | `HTTPS_ACCESS_HOST` | 空 | 设置后启用 8443 HTTPS,自动生成该 IP/域名的自签名证书 |
 | `DSH_SESSION_DAYS` | `7` | 会话有效期(天) |
 | `DSH_AUTH_DEBUG` | `0` | 设为 `1` 输出登录调试日志 |
+| `DSH_DEPLOY_PLUGINS` | `0` | 设为 `1`: 首次启动释放本地自定义插件(见上文"自定义插件"节) |
+| `DSH_SYNOLOGY_WEBHOOK_URL` | 空 | notify 插件: 群晖 Chat webhook(与配置文件二选一) |
 | `DSH_IMAGE` | `dsh-nas:latest` | compose 中指定镜像(如 `ghcr.io/<用户名>/dsh-nas:latest`) |
 
 ## 更新版本
