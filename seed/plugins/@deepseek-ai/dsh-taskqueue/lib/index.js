@@ -1,6 +1,8 @@
 import { readFile, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { defineTool } from "@deepseek-ai/dsh-tools";
+import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
 
 /**
  * @deepseek-ai/dsh-taskqueue (本地辅助插件, 非官方包)
@@ -14,16 +16,25 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
  * (当前: 周一至周五 9-12/14-18 为高峰, 其余空闲), 缓存 30 分钟;
  * 解析失败回退内置定义。官方调整时段会自动跟随。
  *
- * 会话绑定: 每个任务在创建时记录所在会话(sessionId)。派发时优先投递回
- * 创建它的会话(该会话离线时按 /queue target 设置的兜底目标, 再退到任意
- * 在线会话), 因此不同会话创建的任务会派发到各自会话继续。
+ * 会话绑定 (v0.3.0): 每个任务在"排队时"即建立一个专属新会话 (ownSession),
+ * 任务派发到自己的专属会话执行 —— 每个任务一个窗口, 不再复用/挤占其他会话;
+ * 专属会话创建失败时回退绑定创建它的会话。派发时优先投递回任务绑定会话
+ * (离线时按 /queue target 设置的兜底目标, 再退到任意在线会话)。
+ *
+ * 即时反馈 (v0.3.0): queue_add 成功后向当前会话注入 notice/banner 横幅
+ * (kind="queue", 非 surface 事件 → 不进入模型历史、不消耗 token),
+ * 由 dsh-notice-banner client 插件渲染成蓝色"任务队列"弹窗。
+ *
+ * 自动标题 (v0.3.0): 派发到专属会话时, 若会话尚无标题则按任务内容设置
+ * 确定性标题 (source="user" 固定, 不触发 LLM 标题生成); 另注册 session_rename
+ * 模型工具, agent 在回答时可顺手把标题改得更贴切。
  *
  * 派发: 通过 agent.followup 把任务文本作为 user message(source.kind="user",
  * 与 /goal 插件一致)投递到目标会话, 在对话中显示为一条普通用户消息记录,
  * agent 空闲后执行。
  *
  * 斜杠命令:
- *   /queue add <内容>                   入队, 等低谷自动执行
+ *   /queue add <内容>                   入队, 建专属会话, 等低谷自动执行
  *   /queue add --at "HH:mm|YYYY-MM-DD HH:mm" <内容>   指定时间执行
  *   /queue list                         查看队列
  *   /queue cancel <id>                  取消
@@ -162,6 +173,70 @@ export async function apply(ctx) {
 		return windows;
 	}
 
+	// ---------- 无 token 横幅反馈 (v0.3.0) ----------
+	// 自定义会话事件 notice/banner: 非 surface 事件, 不进入模型历史、不消耗 token,
+	// 由 dsh-notice-banner client 插件渲染横幅 (kind="queue" = 蓝色"任务队列"徽章)。
+	// Set.add 幂等, 与其他插件重复注册无副作用 (持久化读取路径要求注册, 见 DSH 速查坑 A)。
+	KNOWN_SESSION_EVENT_TYPES.add("notice/banner");
+	/**
+	 * 向会话注入队列横幅。⚠️ 必须在 session/event 观察者派发之外执行 (坑 B:
+	 * 观察者内同步 append 会被静默吞掉), 因此一律 setTimeout 延迟。
+	 */
+	function appendQueueBanner(session, payload) {
+		if (!session) return;
+		setTimeout(() => {
+			try {
+				session.append("notice/banner", { kind: "queue", time: Date.now(), ...payload });
+			} catch (err) {
+				ctx.logger?.warn?.(`dsh-taskqueue: 横幅注入失败: ${String(err?.message ?? err)}`);
+			}
+		}, 100);
+	}
+
+	// ---------- 专属会话 (v0.3.0) ----------
+	// 每个任务排队时建立独立会话, 派发到自己的窗口, 避免多个任务挤进同一会话。
+	// 与会话创建/恢复的宿主路径 (ensureSession) 保持一致: 默认模型 + preset 挂载,
+	// 否则恢复/新建的 agent 缺工具集、{{model}} 无值, 无法正常执行 (v0.2.5 踩坑)。
+	const taskSessionHandles = new Map(); // sessionId -> AgentHandle (取消任务时销毁)
+	async function createTaskSession(cwd) {
+		const sessionId = `session-${randomUUID()}`;
+		const defaultModel = ctx.get?.("agentDefaultModel")?.currentSelection?.() ?? {};
+		const presets = ctx.get?.("agentPresets");
+		let agentPreset;
+		if (presets) {
+			try {
+				agentPreset = (await presets.resolve()).id; // 默认 preset id (standard-fetch)
+			} catch { /* 无 preset 名单时跳过, 与宿主一致 */ }
+		}
+		const handle = await ctx.agents.create({
+			sessionId,
+			agentOptions: {
+				...(defaultModel.provider ? { provider: defaultModel.provider } : {}),
+				...(defaultModel.model ? { model: defaultModel.model } : {})
+			},
+			meta: {
+				cwd,
+				...(agentPreset === void 0 ? {} : { agentPreset })
+			},
+			setup: async (agentCtx) => {
+				if (presets) await presets.mount(agentCtx);
+			}
+		});
+		taskSessionHandles.set(sessionId, handle);
+		return { sessionId, agent: handle.agent };
+	}
+	/** 取消任务时销毁其专属会话 (释放 agent), 失败仅告警不阻塞 */
+	async function disposeTaskSession(sessionId) {
+		const handle = taskSessionHandles.get(sessionId);
+		if (!handle) return;
+		taskSessionHandles.delete(sessionId);
+		try {
+			await handle.dispose();
+		} catch (err) {
+			ctx.logger?.warn?.(`dsh-taskqueue: 销毁专属会话 ${shortSession(sessionId)} 失败: ${String(err?.message ?? err)}`);
+		}
+	}
+
 	// ---------- 派发 ----------
 	// 派发是"读状态->派发->写状态"的非原子流程, 并发(定时 tick + 手动 run-now)
 	// 时可能基于旧状态互相覆盖, 导致任务被重复派发。用 promise 链把所有派发串行化。
@@ -194,6 +269,22 @@ export async function apply(ctx) {
 		agent.followup(message);
 		task.status = "dispatched";
 		task.dispatchedAt = new Date().toISOString();
+		// 自动标题 (v0.3.0): 若目标会话尚无标题, 按任务内容设置确定性标题 —
+		// 让派发窗口在侧边栏立即可辨识 (source.kind="user" 固定标题, 不触发 LLM 生成)。
+		try {
+			const session = agent.session;
+			const hasTitle = session?.events?.some((e) => e.type === "session/title");
+			if (session && !hasTitle) {
+				const title = `任务 #${task.id} · ${oneLine(task.content).slice(0, 20)}`;
+				session.append("session/title", {
+					title,
+					messageSeqs: [],
+					source: { kind: "user" }
+				});
+			}
+		} catch (err) {
+			ctx.logger?.warn?.(`dsh-taskqueue: 设置任务 #${task.id} 会话标题失败: ${String(err?.message ?? err)}`);
+		}
 		const ok = await writeState(state);
 		if (!ok) ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${task.id} 已派发但状态落盘失败, 重启后可能重复派发`);
 		ctx.logger?.info?.(`dsh-taskqueue: 已派发任务 #${task.id} 到 agent ${agent.id}`);
@@ -326,16 +417,32 @@ export async function apply(ctx) {
 				if (rest.includes("--at") && !at) return { kind: "error", text: "--at 时间格式无效 (HH:mm 或 YYYY-MM-DD HH:mm, 且需为未来)" };
 				return await mutateState(async (state) => {
 					const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
-					state.tasks.push({
+					const task = {
 						id,
 						content,
 						createdAt: new Date().toISOString(),
 						status: "pending",
 						...(sessionId ? { sessionId } : {}),
 						...(at ? { scheduledAt: at } : {})
-					});
+					};
+					// v0.3.0: 每个任务排队时建立专属会话 (ownSession), 派发到自己的窗口;
+					// 创建失败回退绑定当前会话 (老行为)。
+					const cwd = invocation?.agent?.session?.header?.cwd;
+					try {
+						const created = await createTaskSession(cwd ?? "/workspace");
+						task.sessionId = created.sessionId;
+						task.ownSession = true;
+					} catch (err) {
+						ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${id} 专属会话创建失败, 回退绑定当前会话: ${String(err?.message ?? err)}`);
+					}
+					state.tasks.push(task);
 					const when = at ? `于 ${beijingNowString(new Date(at))}` : "等低谷时段自动执行";
-					return { kind: "success", text: `任务 #${id} 已入队 (${when}, 派发到当前会话 ${shortSession(sessionId)}): ${content}` };
+					const where = task.ownSession ? `专属会话 ${shortSession(task.sessionId)}` : `当前会话 ${shortSession(task.sessionId)}`;
+					appendQueueBanner(invocation?.agent?.session, {
+						title: `任务 #${id} 已入队`,
+						lines: [`执行: ${when}`, `派发到: ${where}`, `内容: ${oneLine(content).slice(0, 40)}`]
+					});
+					return { kind: "success", text: `任务 #${id} 已入队 (${when}, 派发到${where}): ${content}` };
 				});
 			}
 			case "list": {
@@ -350,7 +457,8 @@ export async function apply(ctx) {
 					const when = t.scheduledAt
 						? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
 						: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中");
-					lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
+					const mark = t.ownSession ? "专属" : "";
+					lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${when}]${t.sessionId ? ` (${mark}${shortSession(t.sessionId)})` : ""}`);
 				}
 				for (const t of rest2) {
 					lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${STATUS_TEXT[t.status] ?? t.status}]`);
@@ -365,7 +473,9 @@ export async function apply(ctx) {
 					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
 					if (!t) return { kind: "error", text: `未找到排队中的任务 #${id}` };
 					t.status = "cancelled";
-					return { kind: "success", text: `任务 #${id} 已取消` };
+					// v0.3.0: 取消时销毁该任务专属会话, 释放 agent
+					if (t.ownSession && t.sessionId) await disposeTaskSession(t.sessionId);
+					return { kind: "success", text: `任务 #${id} 已取消${t.ownSession ? " (专属会话已销毁)" : ""}` };
 				});
 			}
 			case "edit": {
@@ -402,10 +512,10 @@ export async function apply(ctx) {
 			}
 			case "help": case "":
 				return { kind: "success", text: [
-					"/queue add <内容>                   入队, 派发回当前会话, 等低谷自动执行",
+					"/queue add <内容>                   入队(建专属会话), 等低谷自动执行",
 					"/queue add --at \"HH:mm\" <内容>    指定时间执行 (HH:mm 或 YYYY-MM-DD HH:mm)",
 					"/queue list                         查看队列(含各任务绑定会话)",
-					"/queue cancel <id>                  取消任务",
+					"/queue cancel <id>                  取消任务(销毁专属会话)",
 					"/queue edit <id> <新内容>           修改任务内容",
 					"/queue run-now <id>                 立即派发(不等低谷)",
 					"/queue target [会话id]              查看/设置兜底派发目标会话",
@@ -421,7 +531,7 @@ export async function apply(ctx) {
 	// ---------- 模型工具 (不依赖客户端斜杠命令, 自然语言即可调用) ----------
 	ctx.tools.register(defineTool({
 		name: "queue_add",
-		description: "把任务加入低谷时段任务队列: 默认等官方低谷价时段(动态解析官方页)自动派发回当前会话执行, 也可用 at 指定时间(北京时区 HH:mm 或 YYYY-MM-DD HH:mm)",
+		description: "把任务加入低谷时段任务队列: 排队时自动为该任务建立专属会话, 默认等官方低谷价时段(动态解析官方页)自动派发到专属会话执行, 也可用 at 指定时间(北京时区 HH:mm 或 YYYY-MM-DD HH:mm)",
 		parameters: {
 			content: { type: "string", required: true, description: "任务内容" },
 			at: { type: "string", description: "可选指定时间: HH:mm 或 YYYY-MM-DD HH:mm (北京时区)" }
@@ -443,13 +553,29 @@ export async function apply(ctx) {
 			if (args.at && !at) throw new Error("at 时间格式无效 (HH:mm 或 YYYY-MM-DD HH:mm, 且需为未来)");
 			return await mutateState(async (state) => {
 				const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
-				state.tasks.push({
+				const task = {
 					id, content: args.content, createdAt: new Date().toISOString(), status: "pending",
 					...(sessionId ? { sessionId } : {}),
 					...(at ? { scheduledAt: at } : {})
-				});
+				};
+				// v0.3.0: 每个任务排队时建立专属会话 (ownSession), 派发到自己的窗口;
+				// 创建失败回退绑定当前会话 (老行为)。
+				const cwd = exec?.agent?.session?.header?.cwd;
+				try {
+					const created = await createTaskSession(cwd ?? "/workspace");
+					task.sessionId = created.sessionId;
+					task.ownSession = true;
+				} catch (err) {
+					ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${id} 专属会话创建失败, 回退绑定当前会话: ${String(err?.message ?? err)}`);
+				}
+				state.tasks.push(task);
 				const when = at ? `于 ${beijingNowString(new Date(at))}` : "等低谷时段自动执行";
-				return { id, text: `任务 #${id} 已入队 (${when}, 派发回当前会话 ${shortSession(sessionId)}): ${args.content}` };
+				const where = task.ownSession ? `专属会话 ${shortSession(task.sessionId)}` : `当前会话 ${shortSession(task.sessionId)}`;
+				appendQueueBanner(exec?.agent?.session, {
+					title: `任务 #${id} 已入队`,
+					lines: [`执行: ${when}`, `派发到: ${where}`, `内容: ${oneLine(args.content).slice(0, 40)}`]
+				});
+				return { id, text: `任务 #${id} 已入队 (${when}, 派发到${where}): ${args.content}` };
 			});
 		},
 		presentCall: (args) => ({ card: "generic", title: "加入任务队列", kind: "other", rawInput: args })
@@ -480,7 +606,8 @@ export async function apply(ctx) {
 				const when = t.scheduledAt
 					? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
 					: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中");
-				lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
+				const mark = t.ownSession ? "专属" : "";
+				lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${when}]${t.sessionId ? ` (${mark}${shortSession(t.sessionId)})` : ""}`);
 			}
 			const done = state.tasks.filter((t) => t.status !== "pending");
 			for (const t of done) {
@@ -505,7 +632,9 @@ export async function apply(ctx) {
 				const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
 				if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
 				t.status = "cancelled";
-				return { text: `任务 #${args.id} 已取消` };
+				// v0.3.0: 取消时销毁该任务专属会话, 释放 agent
+				if (t.ownSession && t.sessionId) await disposeTaskSession(t.sessionId);
+				return { text: `任务 #${args.id} 已取消${t.ownSession ? " (专属会话已销毁)" : ""}` };
 			});
 		},
 		presentCall: (args) => ({ card: "generic", title: "取消任务", kind: "other", rawInput: args })
@@ -552,5 +681,38 @@ export async function apply(ctx) {
 			});
 		},
 		presentCall: (args) => ({ card: "generic", title: "立即派发任务", kind: "other", rawInput: args })
+	}));
+
+	// ---------- 会话标题工具 (v0.3.0) ----------
+	// agent 发现本会话第一条消息是队列自动派发任务时, 可在回答时顺手把会话标题
+	// 改成更贴切的标题 (用户需求: "agent 顺便把当前的会话标题修改成合适的标题")。
+	ctx.tools.register(defineTool({
+		name: "session_rename",
+		description: "把当前会话的标题修改为指定标题 (固定标题, 不会再次被自动生成覆盖; 适合在队列自动派发任务等场景给会话起个贴切的名字)",
+		parameters: { title: { type: "string", required: true, description: "新会话标题" } },
+		output: {
+			schema: { type: "object", additionalProperties: false, properties: { text: { type: "string", required: true } } },
+			render: (_args, value) => [{ type: "text", text: value.text }]
+		},
+		execute: async (args, exec) => {
+			const session = exec?.agent?.session;
+			if (!session) throw new Error("无法获取当前会话");
+			const normalized = String(args.title ?? "").trim();
+			if (!normalized) throw new Error("标题不能为空");
+			// 优先走 sessionTitle 服务 (规范化 + 固定 + 取代在途自动生成), 退化则直接 append
+			// (source=user + messageSeqs=[] 满足标题不变式: user 来源必须空 messageSeqs)。
+			const titles = ctx.get?.("sessionTitle");
+			if (titles?.rename) {
+				const accepted = titles.rename(session, normalized);
+				return { text: `会话标题已改为: ${accepted.title}` };
+			}
+			session.append("session/title", {
+				title: normalized,
+				messageSeqs: [],
+				source: { kind: "user" }
+			});
+			return { text: `会话标题已改为: ${normalized}` };
+		},
+		presentCall: (args) => ({ card: "generic", title: "修改会话标题", kind: "other", rawInput: args })
 	}));
 }
