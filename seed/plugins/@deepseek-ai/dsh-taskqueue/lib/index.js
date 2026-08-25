@@ -35,6 +35,9 @@ import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
  * 自动标题 (v0.3.1): 入队时即给会话设置确定性标题"任务 #N · 内容前缀"
  * (source="user" 固定, 不触发 LLM 标题生成、不覆盖已有标题), agent 第一次
  * 回复前标题必然已在; 另注册 session_rename 模型工具, agent 可顺手改得更贴切。
+ * 派发末尾提示 (v0.3.2): 派发消息在用户任务内容之后追加一段固定提示, 要求
+ * agent 第一次回答时根据当前对话内容用 session_rename 把本会话标题重命名为
+ * 贴切的任务标题 —— 侧边栏标题由 agent 按实际任务内容定, 而非固定前缀。
  *
  * 取消 (v0.3.1): 转正会话若只绑定本任务一个 pending 任务, 取消时归档该会话
  * (workspaceRegistry.archiveSession → 从侧边栏移出, 可恢复); 专属会话则 dispose。
@@ -62,6 +65,11 @@ const WINDOW_CACHE_TTL_MS = 30 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60000;
 // 派发后超过该时长仍未消费(消息丢失)才重派发, 避免和正常执行竞态
 const REDISPATCH_GRACE_MS = 2 * 60 * 1000;
+// 派发消息末尾的固定提示 (v0.3.2): 除用户输入的任务内容外, 追加一段指令,
+// 要求 agent 在第一次回答时根据当前对话内容用 session_rename 工具把本会话
+// 标题重命名为贴切的任务标题 —— 派发窗口在侧边栏的标题贴合实际任务。
+const DISPATCH_TRAILING_HINT =
+	"\n\n[末尾提示] 请在第一次回答时, 根据当前对话内容, 用 session_rename 工具把本会话标题重命名为贴切的任务标题。";
 
 // 内置兜底 (2026-08-23 官方: 周一至周五 9-12/14-18 高峰, 其余空闲)
 const FALLBACK_WINDOWS = { weekdaysOnly: true, windows: [[9, 12], [14, 18]] };
@@ -372,8 +380,10 @@ export async function apply(ctx, config) {
 	async function dispatchTask(state, task, agent) {
 		const message = createUserMessage({
 			// 消息前加"自动调度任务 #N"提示, 方便在对话里一眼识别出是队列自动派发的
-			// (而非自己手动输入的消息), 并知道是第几号任务。
-			content: [{ type: "text", text: `[任务队列] 【自动调度任务 #${task.id}】 ${task.content}` }],
+			// (而非自己手动输入的消息), 并知道是第几号任务;
+			// 末尾追加 DISPATCH_TRAILING_HINT (v0.3.2): 要求 agent 第一次回答时
+			// 根据当前对话内容用 session_rename 重命名本会话标题。
+			content: [{ type: "text", text: `[任务队列] 【自动调度任务 #${task.id}】 ${task.content}${DISPATCH_TRAILING_HINT}` }],
 			// source.kind="user" 让 GUI 把它渲染成普通用户气泡(与 /goal 插件一致),
 			// 派发后在对话中形成可见的记录, 而不是折叠的"上下文注入"灰条。
 			source: { kind: "user" }

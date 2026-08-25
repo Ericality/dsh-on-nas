@@ -1,6 +1,6 @@
 {
   "name": "@deepseek-ai/dsh-taskqueue",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Client-level task queue: dump non-urgent ideas, auto-execute during off-peak (cheap) windows or at set times (local helper plugin, not an official package)",
   "type": "module",
   "main": "lib/index.js",
