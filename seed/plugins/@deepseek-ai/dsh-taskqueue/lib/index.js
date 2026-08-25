@@ -197,6 +197,7 @@ export async function apply(ctx) {
 	// 每个任务排队时建立独立会话, 派发到自己的窗口, 避免多个任务挤进同一会话。
 	// 与会话创建/恢复的宿主路径 (ensureSession) 保持一致: 默认模型 + preset 挂载,
 	// 否则恢复/新建的 agent 缺工具集、{{model}} 无值, 无法正常执行 (v0.2.5 踩坑)。
+	// ⚠️ 建会话后必须 attach 到 cwd 对应 workspace, 否则 GUI 侧边栏落在"未分组"。
 	const taskSessionHandles = new Map(); // sessionId -> AgentHandle (取消任务时销毁)
 	async function createTaskSession(cwd) {
 		const sessionId = `session-${randomUUID()}`;
@@ -222,6 +223,15 @@ export async function apply(ctx) {
 				if (presets) await presets.mount(agentCtx);
 			}
 		});
+		// attach 到 cwd 对应 workspace (与宿主 sessions.create 一致): 否则会话落在未分组
+		try {
+			const workspaces = ctx.get?.("workspaceRegistry");
+			const workspace = workspaces && cwd ? await workspaces.resolveByPath(cwd) : void 0;
+			if (workspace) await workspace.attachSession(sessionId);
+			else ctx.logger?.warn?.(`dsh-taskqueue: 专属会话 ${shortSession(sessionId)} 未找到 cwd=${cwd} 对应 workspace, 将显示在未分组`);
+		} catch (err) {
+			ctx.logger?.warn?.(`dsh-taskqueue: 专属会话 ${shortSession(sessionId)} attach workspace 失败: ${String(err?.message ?? err)}`);
+		}
 		taskSessionHandles.set(sessionId, handle);
 		return { sessionId, agent: handle.agent };
 	}
