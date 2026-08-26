@@ -336,9 +336,10 @@ export async function apply(ctx, config) {
 		}
 		state.tasks.push(task);
 		// 入队唯一提示: notice/banner 横幅 (非 surface 事件, 零 token)
+		// v0.4.1: 内容完整显示不截断 (原 slice(0,40) 截断已去掉, 横幅可折叠长内容无妨)
 		appendQueueBanner(session, {
 			title: `任务 #${id} 已入队`,
-			lines: [`执行: ${when}`, `内容: ${oneLine(content).slice(0, 40)}`]
+			lines: [`执行: ${when}`, `内容: ${content}`]
 		});
 		return { id, when };
 	}
