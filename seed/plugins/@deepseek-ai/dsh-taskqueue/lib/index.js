@@ -132,9 +132,11 @@ function shortSession(id) {
 // ---------- 状态持久化 ----------
 async function readState() {
 	try {
-		return JSON.parse(await readFile(STATE_FILE, "utf8"));
+		const s = JSON.parse(await readFile(STATE_FILE, "utf8"));
+		if (!s.locks) s.locks = {}; // v0.4.3: 编辑锁字段 (兼容旧状态文件)
+		return s;
 	} catch {
-		return { version: 2, targetSessionId: null, tasks: [] };
+		return { version: 2, targetSessionId: null, tasks: [], locks: {} };
 	}
 }
 
@@ -152,6 +154,32 @@ const STATUS_TEXT = {
 	dispatched: "已派发",
 	cancelled: "已取消"
 };
+
+// ---------- 编辑锁 (v0.4.3) ----------
+// 客户端面板编辑任务时经 /queue RPC editstart 锁定, 防止 tick 自动派发把正在编辑的
+// 任务发出去 (用户编辑中被打断, 内容未保存就跑了); 同会话(id 更大)的任务也暂停派发,
+// 编辑期间不被派发消息打断。editend (保存/取消/组件卸载) 释放。
+const LOCK_TTL_MS = 30 * 60 * 1000; // 30 分钟无操作自动释放 (防用户关页面导致永久锁)
+
+/** 清理过期编辑锁 (只改内存, 由调用方决定是否落盘) */
+function cleanupStaleLocks(state) {
+	if (!state.locks) return;
+	const now = Date.now();
+	for (const tid of Object.keys(state.locks)) {
+		const lock = state.locks[tid];
+		if (!lock || now - Date.parse(lock.since) > LOCK_TTL_MS) delete state.locks[tid];
+	}
+}
+
+/** 任务是否被编辑锁阻止派发: 自身被锁, 或同会话有锁且本任务在锁任务之后 (按 id) */
+function isTaskLocked(state, task) {
+	if (!state.locks || Object.keys(state.locks).length === 0) return false;
+	if (state.locks[task.id]) return true;
+	for (const [tid, lock] of Object.entries(state.locks)) {
+		if (lock && lock.sessionId && lock.sessionId === task.sessionId && task.id > parseInt(tid, 10)) return true;
+	}
+	return false;
+}
 
 /** 列表一行显示用: 压缩连续空白为单空格并去首尾 */
 function oneLine(s) {
@@ -337,7 +365,9 @@ export async function apply(ctx, config) {
 		state.tasks.push(task);
 		// 入队唯一提示: notice/banner 横幅 (非 surface 事件, 零 token)
 		// v0.4.1: 内容完整显示不截断 (原 slice(0,40) 截断已去掉, 横幅可折叠长内容无妨)
+		// v0.4.3: openPanel=true → 横幅出现即展开手风琴面板, 新任务可直接编辑 (未派发前)
 		appendQueueBanner(session, {
+			openPanel: true,
 			title: `任务 #${id} 已入队`,
 			lines: [`执行: ${when}`, `内容: ${content}`]
 		});
@@ -497,9 +527,11 @@ export async function apply(ctx, config) {
 			const state = await readState();
 			const windowsNow = await resolveWindows();
 			const now = Date.now();
-			// 1) 派发到期任务 (pending)
+			// 1) 派发到期任务 (pending); v0.4.3: 编辑锁中的任务 (及同会话后续任务) 跳过
+			cleanupStaleLocks(state);
 			const due = state.tasks.filter((t) => t.status === "pending"
-				&& (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !isBeijingPeak(windowsNow)));
+				&& (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !isBeijingPeak(windowsNow))
+				&& !isTaskLocked(state, t));
 			for (const task of due) {
 				const agent = await findTargetAgent(state, task);
 				if (!agent) continue; // 该任务无可用会话, 下次再试
@@ -559,16 +591,15 @@ export async function apply(ctx, config) {
 				const rest2 = state.tasks.filter((t) => t.status !== "pending");
 				const windowsNow = await resolveWindows();
 				const peak = isBeijingPeak(windowsNow);
-				// v0.4.2: 注入 kind=queue 横幅, openPanel=true → 出现即展开手风琴面板
+				// v0.4.3: 横幅文字精简 (历史移到面板底部), openPanel=true 出现即展开手风琴
 				appendQueueBanner(invocation?.agent?.session, {
 					openPanel: true,
 					title: `任务队列 · 排队中 ${pending.length} 个`,
 					lines: [
 						pending.length === 0
 							? "(队列为空)"
-							: pending.map((t) => `#${t.id} ${t.content}${t.scheduledAt ? `\n  定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}` : `\n  ${peak ? "等低谷" : "低谷中"}`}${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`).join("\n"),
-						rest2.length > 0 ? `历史 ${rest2.length} 个: ${rest2.map((t) => `#${t.id} ${STATUS_TEXT[t.status] ?? t.status}`).join(" / ")}` : "",
-						"点上方「队列」按钮展开管理面板 (编辑/取消/立即派发)"
+							: `排队中 ${pending.length} 个 / 历史 ${rest2.length} 个`,
+						"任务列表见下方面板: 点行展开可 编辑/取消/立即派发"
 					]
 				});
 				return { kind: "success", text: `任务队列: ${pending.length} 排队中 / ${rest2.length} 历史 (详情见横幅面板)` };
@@ -609,6 +640,7 @@ export async function apply(ctx, config) {
 				return await mutateState(async (state) => {
 					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
 					if (!t) return { kind: "error", text: `未找到排队中的任务 #${id}` };
+					if (isTaskLocked(state, t)) return { kind: "error", text: `任务 #${id} 正在编辑中, 暂不能派发 (保存或取消编辑后再试)` };
 					const agent = await findTargetAgent(state, t);
 					if (!agent) return { kind: "error", text: "任务绑定会话已离线且无兜底会话, 稍后再试" };
 					await dispatchTask(state, t, agent);
@@ -700,17 +732,15 @@ export async function apply(ctx, config) {
 			const peak = isBeijingPeak(windowsNow);
 			const pending = state.tasks.filter((t) => t.status === "pending");
 			const done = state.tasks.filter((t) => t.status !== "pending");
-			// v0.4.2: 注入 kind=queue 横幅, openPanel=true → 出现即展开手风琴面板 (list 一步到位),
-			// 任务内容完整显示不截断; 面板内 pending 任务可编辑 (未派发前)
+			// v0.4.3: 横幅文字精简 (历史移到面板底部), openPanel=true 出现即展开手风琴
 			appendQueueBanner(exec?.agent?.session, {
 				openPanel: true,
 				title: `任务队列 · 排队中 ${pending.length} 个`,
 				lines: [
 					pending.length === 0
 						? "(队列为空)"
-						: pending.map((t) => `#${t.id} ${t.content}${t.scheduledAt ? `\n  定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}` : `\n  ${peak ? "等低谷" : "低谷中"}`}${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`).join("\n"),
-					done.length > 0 ? `历史 ${done.length} 个: ${done.map((t) => `#${t.id} ${STATUS_TEXT[t.status] ?? t.status}`).join(" / ")}` : "",
-					"点上方「队列」按钮展开管理面板 (编辑/取消/立即派发)"
+						: `排队中 ${pending.length} 个 / 历史 ${done.length} 个`,
+					"任务列表见下方面板: 点行展开可 编辑/取消/立即派发"
 				]
 			});
 			return { text: `任务队列: ${pending.length} 排队中 / ${done.length} 历史 (详情见横幅面板)` };
@@ -781,6 +811,7 @@ export async function apply(ctx, config) {
 			return await mutateState(async (state) => {
 				const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
 				if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
+				if (isTaskLocked(state, t)) throw new Error(`任务 #${args.id} 正在编辑中, 暂不能派发 (保存或取消编辑后再试)`);
 				const agent = await findTargetAgent(state, t);
 				if (!agent) return { text: `任务 #${t.id} 绑定会话已离线且无兜底会话, 保持排队` };
 				await dispatchTask(state, t, agent);
@@ -804,7 +835,9 @@ export async function apply(ctx, config) {
 	//   list   → { tasks: [...], pendingCount, peak, windowSource, targetSession* }
 	//   edit   { id, content }   → 改排队中任务内容
 	//   cancel { id }            → 取消
-	//   runnow { id }            → 立即派发 (不等低谷)
+	//   runnow { id }            → 立即派发 (不等低谷; 编辑锁中阻止)
+	//   editstart { id }         → 锁定任务 (客户端开始编辑, 防派发) (v0.4.3)
+	//   editend { id }           → 释放锁 (保存/取消/卸载) (v0.4.3)
 	// 返回 { ok: true, value } | { ok: false, error: { code, message } }。
 	// options 传 {}: 不设 authority → register 用 this.trustedHosts (与 /api 同源
 	// 信任列表, 隧道/局域网域名可访问); 传 { authority: "loopback" } 则只认回环。
@@ -816,6 +849,7 @@ export async function apply(ctx, config) {
 				const state = await readState();
 				const windowsNow = await resolveWindows();
 				const peak = isBeijingPeak(windowsNow);
+				cleanupStaleLocks(state);
 				const tasks = state.tasks.map((t) => ({
 					id: t.id,
 					content: t.content,
@@ -826,7 +860,8 @@ export async function apply(ctx, config) {
 					sessionShort: shortSession(t.sessionId),
 					whenText: t.scheduledAt
 						? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
-						: (peak ? "等低谷" : "低谷中")
+						: (peak ? "等低谷" : "低谷中"),
+					locked: isTaskLocked(state, t) // v0.4.3: 编辑锁标记 (客户端显示"编辑中")
 				}));
 				return { ok: true, value: {
 					tasks,
@@ -847,6 +882,7 @@ export async function apply(ctx, config) {
 					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
 					if (!t) return { ok: false, error: { code: "not-found", message: `未找到排队中的任务 #${id}` } };
 					t.content = content;
+					if (state.locks) delete state.locks[id]; // 保存成功即释放编辑锁
 					return { ok: true, value: { id: t.id, content: t.content } };
 				});
 			}
@@ -856,6 +892,7 @@ export async function apply(ctx, config) {
 				return await mutateState(async (state) => {
 					const r = await cancelTask(state, id);
 					if (r.kind === "error") return { ok: false, error: { code: "not-found", message: r.text } };
+					if (state.locks) delete state.locks[id];
 					return { ok: true, value: { id, text: r.text } };
 				});
 			}
@@ -865,10 +902,32 @@ export async function apply(ctx, config) {
 				return await mutateState(async (state) => {
 					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
 					if (!t) return { ok: false, error: { code: "not-found", message: `未找到排队中的任务 #${id}` } };
+					if (isTaskLocked(state, t)) {
+						return { ok: false, error: { code: "locked", message: `任务 #${id} 正在编辑中, 暂不能派发 (保存或取消编辑后再试)` } };
+					}
 					const agent = await findTargetAgent(state, t);
 					if (!agent) return { ok: false, error: { code: "unavailable", message: "任务绑定会话已离线且无兜底会话, 稍后再试" } };
 					await dispatchTask(state, t, agent);
 					return { ok: true, value: { id, text: `任务 #${id} 已立即派发到 ${shortSession(agent.id)}` } };
+				});
+			}
+			case "editstart": {
+				const id = payload?.id;
+				if (!Number.isInteger(id)) return { ok: false, error: { code: "bad-request", message: "需要 id(整数)" } };
+				return await mutateState(async (state) => {
+					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
+					if (!t) return { ok: false, error: { code: "not-found", message: `未找到排队中的任务 #${id}` } };
+					state.locks = state.locks ?? {};
+					state.locks[id] = { sessionId: t.sessionId ?? null, since: new Date().toISOString() };
+					return { ok: true, value: { id } };
+				});
+			}
+			case "editend": {
+				const id = payload?.id;
+				if (!Number.isInteger(id)) return { ok: false, error: { code: "bad-request", message: "需要 id(整数)" } };
+				return await mutateState(async (state) => {
+					if (state.locks) delete state.locks[id];
+					return { ok: true, value: { id } };
 				});
 			}
 			default:
