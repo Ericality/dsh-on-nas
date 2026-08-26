@@ -558,25 +558,35 @@ export async function apply(ctx, config) {
 				const pending = state.tasks.filter((t) => t.status === "pending");
 				const rest2 = state.tasks.filter((t) => t.status !== "pending");
 				const windowsNow = await resolveWindows();
-				const now = new Date();
-				const lines = [];
-				if (pending.length === 0) lines.push("(队列为空)");
-				for (const t of pending) {
-					const when = t.scheduledAt
-						? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
-						: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中");
-					lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
-				}
-				for (const t of rest2) {
-					lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${STATUS_TEXT[t.status] ?? t.status}]`);
-				}
-				lines.push(`兜底目标: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置"} · 高峰窗口: ${windowSource}`);
-				return { kind: "success", text: lines.join("\n") };
+				const peak = isBeijingPeak(windowsNow);
+				// v0.4.2: 注入 kind=queue 横幅, openPanel=true → 出现即展开手风琴面板
+				appendQueueBanner(invocation?.agent?.session, {
+					openPanel: true,
+					title: `任务队列 · 排队中 ${pending.length} 个`,
+					lines: [
+						pending.length === 0
+							? "(队列为空)"
+							: pending.map((t) => `#${t.id} ${t.content}${t.scheduledAt ? `\n  定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}` : `\n  ${peak ? "等低谷" : "低谷中"}`}${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`).join("\n"),
+						rest2.length > 0 ? `历史 ${rest2.length} 个: ${rest2.map((t) => `#${t.id} ${STATUS_TEXT[t.status] ?? t.status}`).join(" / ")}` : "",
+						"点上方「队列」按钮展开管理面板 (编辑/取消/立即派发)"
+					]
+				});
+				return { kind: "success", text: `任务队列: ${pending.length} 排队中 / ${rest2.length} 历史 (详情见横幅面板)` };
 			}
 			case "cancel": {
 				const id = parseInt(rest, 10);
 				if (!Number.isInteger(id)) return { kind: "error", text: "用法: /queue cancel <id>" };
-				return await mutateState(async (state) => cancelTask(state, id));
+				return await mutateState(async (state) => {
+					const r = await cancelTask(state, id);
+					if (r.kind === "error") return r;
+					// v0.4.2: 取消反馈注入横幅卡片 (完整内容)
+					const t = state.tasks.find((x) => x.id === id);
+					appendQueueBanner(invocation?.agent?.session, {
+						title: `任务 #${id} 已取消`,
+						lines: t ? [`内容: ${t.content}`] : []
+					});
+					return { kind: "success", text: `任务 #${id} 已取消` };
+				});
 			}
 			case "edit": {
 				const m = /^(\d+)\s+(.+)$/.exec(rest);
@@ -585,7 +595,12 @@ export async function apply(ctx, config) {
 					const t = state.tasks.find((x) => x.id === parseInt(m[1], 10) && x.status === "pending");
 					if (!t) return { kind: "error", text: `未找到排队中的任务 #${m[1]}` };
 					t.content = m[2];
-					return { kind: "success", text: `任务 #${t.id} 内容已更新: ${t.content}` };
+					// v0.4.2: 修改反馈注入横幅卡片 (完整新内容)
+					appendQueueBanner(invocation?.agent?.session, {
+						title: `任务 #${t.id} 内容已更新`,
+						lines: [`新内容: ${t.content}`]
+					});
+					return { kind: "success", text: `任务 #${t.id} 内容已更新` };
 				});
 			}
 			case "run-now": {
@@ -597,6 +612,11 @@ export async function apply(ctx, config) {
 					const agent = await findTargetAgent(state, t);
 					if (!agent) return { kind: "error", text: "任务绑定会话已离线且无兜底会话, 稍后再试" };
 					await dispatchTask(state, t, agent);
+					// v0.4.2: 派发反馈注入横幅卡片 (完整内容)
+					appendQueueBanner(invocation?.agent?.session, {
+						title: `任务 #${id} 已派发`,
+						lines: [`内容: ${t.content}`, `派发到: ${shortSession(agent.id)}`]
+					});
 					return { kind: "success", text: `任务 #${id} 已立即派发到 ${shortSession(agent.id)}` };
 				});
 			}
@@ -674,25 +694,26 @@ export async function apply(ctx, config) {
 			},
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
-		execute: async () => {
+		execute: async (_args, exec) => {
 			const state = await readState();
 			const windowsNow = await resolveWindows();
-			const now = new Date();
-			const lines = [];
+			const peak = isBeijingPeak(windowsNow);
 			const pending = state.tasks.filter((t) => t.status === "pending");
-			if (pending.length === 0) lines.push("(队列为空)");
-			for (const t of pending) {
-				const when = t.scheduledAt
-					? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
-					: (isBeijingPeak(windowsNow) ? "等低谷" : "低谷中");
-				lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${when}]${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`);
-			}
 			const done = state.tasks.filter((t) => t.status !== "pending");
-			for (const t of done) {
-				lines.push(`#${t.id} ${oneLine(t.content).slice(0, 50)} [${STATUS_TEXT[t.status] ?? t.status}]`);
-			}
-			lines.push(`兜底目标: ${state.targetSessionId ? shortSession(state.targetSessionId) : "未设置"} · 高峰窗口: ${windowSource}`);
-			return { text: lines.join("\n") };
+			// v0.4.2: 注入 kind=queue 横幅, openPanel=true → 出现即展开手风琴面板 (list 一步到位),
+			// 任务内容完整显示不截断; 面板内 pending 任务可编辑 (未派发前)
+			appendQueueBanner(exec?.agent?.session, {
+				openPanel: true,
+				title: `任务队列 · 排队中 ${pending.length} 个`,
+				lines: [
+					pending.length === 0
+						? "(队列为空)"
+						: pending.map((t) => `#${t.id} ${t.content}${t.scheduledAt ? `\n  定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}` : `\n  ${peak ? "等低谷" : "低谷中"}`}${t.sessionId ? ` (${shortSession(t.sessionId)})` : ""}`).join("\n"),
+					done.length > 0 ? `历史 ${done.length} 个: ${done.map((t) => `#${t.id} ${STATUS_TEXT[t.status] ?? t.status}`).join(" / ")}` : "",
+					"点上方「队列」按钮展开管理面板 (编辑/取消/立即派发)"
+				]
+			});
+			return { text: `任务队列: ${pending.length} 排队中 / ${done.length} 历史 (详情见横幅面板)` };
 		},
 		presentCall: () => ({ card: "generic", title: "查看任务队列", kind: "other" })
 	}));
@@ -705,10 +726,16 @@ export async function apply(ctx, config) {
 			schema: { type: "object", additionalProperties: false, properties: { text: { type: "string", required: true } } },
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
-		execute: async (args) => {
+		execute: async (args, exec) => {
 			return await mutateState(async (state) => {
 				const r = await cancelTask(state, args.id);
 				if (r.kind === "error") throw new Error(r.text);
+				// v0.4.2: 取消反馈注入横幅卡片 (完整内容)
+				const t = state.tasks.find((x) => x.id === args.id);
+				appendQueueBanner(exec?.agent?.session, {
+					title: `任务 #${args.id} 已取消`,
+					lines: t ? [`内容: ${t.content}`] : []
+				});
 				return { text: r.text };
 			});
 		},
@@ -726,12 +753,17 @@ export async function apply(ctx, config) {
 			schema: { type: "object", additionalProperties: false, properties: { text: { type: "string", required: true } } },
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
-		execute: async (args) => {
+		execute: async (args, exec) => {
 			return await mutateState(async (state) => {
 				const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
 				if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
 				t.content = args.content;
-				return { text: `任务 #${t.id} 内容已更新: ${t.content}` };
+				// v0.4.2: 修改反馈注入横幅卡片 (完整新内容)
+				appendQueueBanner(exec?.agent?.session, {
+					title: `任务 #${t.id} 内容已更新`,
+					lines: [`新内容: ${t.content}`]
+				});
+				return { text: `任务 #${t.id} 内容已更新` };
 			});
 		},
 		presentCall: (args) => ({ card: "generic", title: "修改任务", kind: "other", rawInput: args })
@@ -745,13 +777,18 @@ export async function apply(ctx, config) {
 			schema: { type: "object", additionalProperties: false, properties: { text: { type: "string", required: true } } },
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
-		execute: async (args) => {
+		execute: async (args, exec) => {
 			return await mutateState(async (state) => {
 				const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
 				if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
 				const agent = await findTargetAgent(state, t);
 				if (!agent) return { text: `任务 #${t.id} 绑定会话已离线且无兜底会话, 保持排队` };
 				await dispatchTask(state, t, agent);
+				// v0.4.2: 派发反馈注入横幅卡片 (完整内容)
+				appendQueueBanner(exec?.agent?.session, {
+					title: `任务 #${t.id} 已派发`,
+					lines: [`内容: ${t.content}`, `派发到: ${shortSession(agent.id)}`]
+				});
 				return { text: `任务 #${t.id} 已立即派发到 ${shortSession(agent.id)}` };
 			});
 		},
