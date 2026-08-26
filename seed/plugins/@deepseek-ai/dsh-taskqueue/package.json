@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-taskqueue",
-  "version": "0.3.2",
-  "description": "Client-level task queue: dump non-urgent ideas, auto-execute during off-peak (cheap) windows or at set times (local helper plugin, not an official package)",
+  "version": "0.4.0",
+  "description": "Client-level task queue: dump non-urgent ideas, auto-execute during off-peak (cheap) windows or at set times; v0.4.0 adds /queue RPC channel (list/edit/cancel/runnow) for the editable queue panel in dsh-notice-banner (local helper plugin, not an official package)",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

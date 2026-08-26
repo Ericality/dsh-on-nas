@@ -43,6 +43,10 @@ import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
  * (workspaceRegistry.archiveSession → 从侧边栏移出, 可恢复); 专属会话则 dispose。
  * queue_edit 可修改排队中任务内容。
  *
+ * 可编辑队列面板 (v0.4.0): 注册框架通用 RPC 通道 /queue (list/edit/cancel/runnow),
+ * 供 dsh-notice-banner 的队列横幅内嵌面板调用 —— 浏览器里直接查看/编辑/取消/
+ * 立即派发排队任务, 不走模型回合、零 token; 派发前可改, 下发后只读。
+ *
  * 派发: 通过 agent.followup 把任务文本作为 user message(source.kind="user",
  * 与 /goal 插件一致)投递到目标会话, 在对话中显示为一条普通用户消息记录,
  * agent 空闲后执行。
@@ -57,7 +61,11 @@ import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
  *   /queue target [会话id]              查看/设置兜底派发目标会话
  */
 export const name = "dsh-taskqueue";
-export const inject = ["commands", "agents", "tools"];
+// 注意: 插件 ctx 只能解析 inject 声明的服务 (fiber.store 机制) —— v0.4.0 起
+// 队列可编辑面板需要浏览器端 RPC 通道, 故注入 connection (dsh-client-connection,
+// web profile 基础 bundle 必有); 未声明的服务 (如 workspaceRegistry) ctx.get 返回
+// undefined, 属既有限制。
+export const inject = ["commands", "agents", "tools", "connection"];
 
 const STATE_FILE = "/data/dsh/taskqueue.json";
 const PRICING_PAGE_URL = "https://api-docs.deepseek.com/zh-cn/quick_start/pricing";
@@ -748,6 +756,91 @@ export async function apply(ctx, config) {
 		},
 		presentCall: (args) => ({ card: "generic", title: "立即派发任务", kind: "other", rawInput: args })
 	}));
+
+	// ---------- /queue RPC 通道 (v0.4.0) ----------
+	// 浏览器端 client 插件 (dsh-notice-banner 队列面板) 通过框架通用 RPC
+	// (ctx.connection.rpc.call("/queue", "<endpoint>", payload)) 直接读写队列,
+	// 不走模型回合、零 token —— 解决"查看/修改任务列表不方便、修改无弹窗反馈"。
+	// 通道信任策略与 /api 一致 (不传 authority → 沿用 client-connection 的
+	// trustedHosts, 隧道/局域网域名均可访问)。端点:
+	//   list   → { tasks: [...], pendingCount, peak, windowSource, targetSession* }
+	//   edit   { id, content }   → 改排队中任务内容
+	//   cancel { id }            → 取消
+	//   runnow { id }            → 立即派发 (不等低谷)
+	// 返回 { ok: true, value } | { ok: false, error: { code, message } }。
+	// options 传 {}: 不设 authority → register 用 this.trustedHosts (与 /api 同源
+	// 信任列表, 隧道/局域网域名可访问); 传 { authority: "loopback" } 则只认回环。
+	// ⚠️ options 不能省略: register 里直接读 options.authority, 缺参会 TypeError。
+	ctx.get?.("connection")?.rpc?.handle?.("/queue", async (endpoint, payload) => {
+		try {
+			switch (endpoint) {
+			case "list": {
+				const state = await readState();
+				const windowsNow = await resolveWindows();
+				const peak = isBeijingPeak(windowsNow);
+				const tasks = state.tasks.map((t) => ({
+					id: t.id,
+					content: t.content,
+					status: t.status,
+					statusText: STATUS_TEXT[t.status] ?? t.status,
+					createdAt: t.createdAt,
+					scheduledAt: t.scheduledAt ?? null,
+					sessionShort: shortSession(t.sessionId),
+					whenText: t.scheduledAt
+						? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
+						: (peak ? "等低谷" : "低谷中")
+				}));
+				return { ok: true, value: {
+					tasks,
+					pendingCount: tasks.filter((t) => t.status === "pending").length,
+					targetSessionId: state.targetSessionId,
+					targetSessionShort: shortSession(state.targetSessionId),
+					peak,
+					windowSource
+				} };
+			}
+			case "edit": {
+				const id = payload?.id;
+				const content = typeof payload?.content === "string" ? payload.content.trim() : "";
+				if (!Number.isInteger(id) || !content) {
+					return { ok: false, error: { code: "bad-request", message: "需要 id(整数) 与 content(非空字符串)" } };
+				}
+				return await mutateState(async (state) => {
+					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
+					if (!t) return { ok: false, error: { code: "not-found", message: `未找到排队中的任务 #${id}` } };
+					t.content = content;
+					return { ok: true, value: { id: t.id, content: t.content } };
+				});
+			}
+			case "cancel": {
+				const id = payload?.id;
+				if (!Number.isInteger(id)) return { ok: false, error: { code: "bad-request", message: "需要 id(整数)" } };
+				return await mutateState(async (state) => {
+					const r = await cancelTask(state, id);
+					if (r.kind === "error") return { ok: false, error: { code: "not-found", message: r.text } };
+					return { ok: true, value: { id, text: r.text } };
+				});
+			}
+			case "runnow": {
+				const id = payload?.id;
+				if (!Number.isInteger(id)) return { ok: false, error: { code: "bad-request", message: "需要 id(整数)" } };
+				return await mutateState(async (state) => {
+					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
+					if (!t) return { ok: false, error: { code: "not-found", message: `未找到排队中的任务 #${id}` } };
+					const agent = await findTargetAgent(state, t);
+					if (!agent) return { ok: false, error: { code: "unavailable", message: "任务绑定会话已离线且无兜底会话, 稍后再试" } };
+					await dispatchTask(state, t, agent);
+					return { ok: true, value: { id, text: `任务 #${id} 已立即派发到 ${shortSession(agent.id)}` } };
+				});
+			}
+			default:
+				return { ok: false, error: { code: "bad-request", message: `未知端点 ${endpoint}` } };
+			}
+		} catch (err) {
+			ctx.logger?.warn?.(`dsh-taskqueue: /queue RPC ${endpoint} 失败: ${String(err?.message ?? err)}`);
+			return { ok: false, error: { code: "internal", message: String(err?.message ?? err) } };
+		}
+	}, {});
 
 	// ---------- 会话标题工具 (v0.3.0) ----------
 	// agent 发现本会话第一条消息是队列自动派发任务时, 可在回答时顺手把会话标题
