@@ -154,15 +154,9 @@ if (__INSECURE_LAN__) document.getElementById('hint').style.display='block';
   if (!mode) mode = "daily";
   var img;
   if (mode === "folder") {
-    var q = new URLSearchParams();
-    if (sec.folderPath) q.set("path", sec.folderPath);
-    q.set("mode", sec.strategy || "every");
-    if ((sec.strategy || "every") === "interval") {
-      var min = Number(sec.intervalMin);
-      q.set("intervalMs", String((Number.isFinite(min) && min > 0 ? min : 60) * 60000));
-    }
-    q.set("_", String(Date.now()));
-    img = "/wallpaper-folder?" + q.toString();
+    // 跟随聊天背景: mode=current 返回服务端最近一次随机选中的图 (不重新随机),
+    // 与聊天页当前显示的文件夹壁纸一致; 服务端无记录时回退随机一张
+    img = "/wallpaper-folder?mode=current";
   } else if (mode === "custom" && sec.image) {
     img = sec.image;
   } else {
