@@ -102,6 +102,8 @@ function recordFail(ip) {
 function clearFails(ip) { fails.delete(ip); }
 
 // ---------- 登录页 ----------
+// 装修 (2026-08-27): 背景跟随聊天背景 (dsh-bg-image 同一 localStorage 设置, 同域共享),
+// 卡片白色 → 毛玻璃 (backdrop-filter)。无设置/无痕时回退默认每日壁纸 /bing-wallpaper。
 const LOGIN_HTML = `<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -110,17 +112,23 @@ const LOGIN_HTML = `<!doctype html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { min-height: 100vh; display: flex; align-items: center; justify-content: center;
          background: linear-gradient(160deg,#0f1420,#1a2332); font-family: -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
-  .card { width: 340px; padding: 36px 32px; border-radius: 14px; background: #fff; box-shadow: 0 12px 40px rgba(0,0,0,.45); }
+  #bg { position: fixed; inset: 0; z-index: -1; background-size: cover; background-position: center; background-repeat: no-repeat; }
+  .card { width: 340px; padding: 36px 32px; border-radius: 16px;
+          background: rgba(255,255,255,.62); border: 1px solid rgba(255,255,255,.45);
+          -webkit-backdrop-filter: blur(18px) saturate(1.4); backdrop-filter: blur(18px) saturate(1.4);
+          box-shadow: 0 12px 40px rgba(0,0,0,.35); }
   h1 { font-size: 20px; color: #111; margin-bottom: 6px; }
-  p.sub { font-size: 13px; color: #888; margin-bottom: 22px; }
-  label { display: block; font-size: 13px; color: #555; margin: 14px 0 6px; }
-  input { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px; font-size: 15px; outline: none; }
+  p.sub { font-size: 13px; color: #666; margin-bottom: 22px; }
+  label { display: block; font-size: 13px; color: #444; margin: 14px 0 6px; }
+  input { width: 100%; padding: 10px 12px; border: 1px solid rgba(0,0,0,.12); border-radius: 8px; font-size: 15px; outline: none;
+          background: rgba(255,255,255,.75); }
   input:focus { border-color: #4d6bfe; }
   button { width: 100%; margin-top: 22px; padding: 11px; border: 0; border-radius: 8px; background: #4d6bfe; color: #fff; font-size: 15px; cursor: pointer; }
   button:hover { background: #3d59e0; }
   .err { display: none; margin-top: 14px; padding: 8px 10px; border-radius: 8px; background: #fdeaea; color: #c0392b; font-size: 13px; }
-  .hint { display: none; margin-bottom: 16px; padding: 9px 11px; border-radius: 8px; background: #fff8e6; border: 1px solid #f0d48a; color: #8a6d1a; font-size: 13px; line-height: 1.5; }
+  .hint { display: none; margin-bottom: 16px; padding: 9px 11px; border-radius: 8px; background: rgba(255,248,230,.92); border: 1px solid #f0d48a; color: #8a6d1a; font-size: 13px; line-height: 1.5; }
 </style></head><body>
+<div id="bg"></div>
 <div class="card">
   <div class="hint" id="hint">当前是明文 HTTP 访问。局域网请使用 <b>https://NAS_IP:8443</b> 访问, 否则界面无法正常工作。</div>
   <h1>DeepSeek Harness</h1>
@@ -137,6 +145,34 @@ const LOGIN_HTML = `<!doctype html>
 <script>
 if (location.search.includes('err=1')) document.getElementById('err').style.display='block';
 if (__INSECURE_LAN__) document.getElementById('hint').style.display='block';
+// 背景与聊天背景一致: 读 dsh-bg-image 同一份设置 (同域 localStorage), 复刻其模式→URL 逻辑
+(function () {
+  var KEY = "dsh.bg-image.v2", DEF = "/bing-wallpaper", sec = {};
+  try { var raw = localStorage.getItem(KEY); if (raw) sec = JSON.parse(raw) || {}; } catch (e) {}
+  var mode = sec.mode;
+  if (!mode && sec.image && sec.image !== DEF) mode = "custom";
+  if (!mode) mode = "daily";
+  var img;
+  if (mode === "folder") {
+    var q = new URLSearchParams();
+    if (sec.folderPath) q.set("path", sec.folderPath);
+    q.set("mode", sec.strategy || "every");
+    if ((sec.strategy || "every") === "interval") {
+      var min = Number(sec.intervalMin);
+      q.set("intervalMs", String((Number.isFinite(min) && min > 0 ? min : 60) * 60000));
+    }
+    q.set("_", String(Date.now()));
+    img = "/wallpaper-folder?" + q.toString();
+  } else if (mode === "custom" && sec.image) {
+    img = sec.image;
+  } else {
+    img = DEF;
+  }
+  var bg = document.getElementById("bg");
+  if (bg) {
+    bg.style.background = 'linear-gradient(rgba(0,0,0,.28),rgba(0,0,0,.28)),url("' + img.replace(/["\\\\]/g, "\\\\$&") + '") center/cover no-repeat';
+  }
+})();
 </script>
 </body></html>`;
 
@@ -267,7 +303,10 @@ const handler = (req, res) => {
   //  - /public/ 公开分享区: dsh-fileserve 的免登录路由, 只服务 /workspace/public/ 目录。
   //    注意: 本白名单只负责"放行进 dsh web", 越界防护 (目录穿越/符号链接逃逸)
   //    由插件端对 public 根目录做 resolve+realpath 双重校验兜底, 不依赖这里的前缀匹配。
-  const PUBLIC_PATHS = ['/manifest.webmanifest', '/apple-touch-icon.png', '/dsh-icon-512.png', '/favicon.svg', '/favicon.ico', '/public/'];
+  //  - /bing-wallpaper /wallpaper-folder: 登录页背景图端点 (与聊天背景同一壁纸源,
+  //    未登录时登录页也要能加载; 仅壁纸图片, 无敏感数据)。前缀匹配会连带
+  //    -meta 介绍端点 (title/body/图片URL, 无敏感信息, 可接受)。
+  const PUBLIC_PATHS = ['/manifest.webmanifest', '/apple-touch-icon.png', '/dsh-icon-512.png', '/favicon.svg', '/favicon.ico', '/public/', '/bing-wallpaper', '/wallpaper-folder'];
   if (PUBLIC_PATHS.some((p) => url.pathname === p || url.pathname.startsWith(p))) {
     proxy(req, res);
     return;
