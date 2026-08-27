@@ -261,9 +261,13 @@ const handler = (req, res) => {
     return;
   }
 
-  // PWA 静态资源免登录: manifest/图标/favicon 必须无 Cookie 也能获取
-  // (iOS 添加到主屏幕/浏览器抓 favicon 时通常不带会话 Cookie, 拦截会导致图标加载失败)
-  const PUBLIC_PATHS = ['/manifest.webmanifest', '/apple-touch-icon.png', '/dsh-icon-512.png', '/favicon.svg', '/favicon.ico'];
+  // 免登录放行路径:
+  //  - PWA 静态资源: manifest/图标/favicon 必须无 Cookie 也能获取
+  //    (iOS 添加到主屏幕/浏览器抓 favicon 时通常不带会话 Cookie, 拦截会导致图标加载失败)
+  //  - /public/ 公开分享区: dsh-fileserve 的免登录路由, 只服务 /workspace/public/ 目录。
+  //    注意: 本白名单只负责"放行进 dsh web", 越界防护 (目录穿越/符号链接逃逸)
+  //    由插件端对 public 根目录做 resolve+realpath 双重校验兜底, 不依赖这里的前缀匹配。
+  const PUBLIC_PATHS = ['/manifest.webmanifest', '/apple-touch-icon.png', '/dsh-icon-512.png', '/favicon.svg', '/favicon.ico', '/public/'];
   if (PUBLIC_PATHS.some((p) => url.pathname === p || url.pathname.startsWith(p))) {
     proxy(req, res);
     return;

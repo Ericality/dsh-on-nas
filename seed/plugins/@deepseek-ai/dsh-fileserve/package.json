@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-fileserve",
-  "version": "0.1.0",
-  "description": "Serve workspace files as text over HTTP for new-tab viewing (local helper plugin, not an official package)",
+  "version": "0.2.0",
+  "description": "Serve workspace files as text over HTTP for new-tab viewing, plus a login-free /public share area (local helper plugin, not an official package)",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
