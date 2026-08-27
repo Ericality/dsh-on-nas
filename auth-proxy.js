@@ -154,9 +154,11 @@ if (__INSECURE_LAN__) document.getElementById('hint').style.display='block';
   if (!mode) mode = "daily";
   var img;
   if (mode === "folder") {
-    // 跟随聊天背景: mode=current 返回服务端最近一次随机选中的图 (不重新随机),
-    // 与聊天页当前显示的文件夹壁纸一致; 服务端无记录时回退随机一张
-    img = "/wallpaper-folder?mode=current";
+    // 跟随聊天背景: mode=current 返回服务端最近一次随机选中的图并锁定 lockSec 秒
+    // (设置里可配, localStorage dsh.bg-image.v2.lockSec; 默认 120 秒), 锁期内聊天页
+    // 跟随同一张; 服务端无记录时回退随机一张
+    var lock = sec.lockSec ? "&lockSec=" + encodeURIComponent(String(sec.lockSec)) : "";
+    img = "/wallpaper-folder?mode=current" + lock;
   } else if (mode === "custom" && sec.image) {
     img = sec.image;
   } else {
