@@ -374,27 +374,64 @@ export async function apply(ctx, config) {
 		return { id, when };
 	}
 
-	/** 取消任务 (命令/工具共用): 转正会话只绑本任务一个 pending → 归档移出列表; 专属会话 dispose */
+	/** v0.5.0: 已派发且派发消息仍在目标会话收件箱排队 (未被 claim 执行) —— "排队发送中",
+	 *  可取消窗口。派发 = followup 进收件箱 + 立即标 dispatched; 若目标会话正在对话
+	 *  (回合未结束), 消息躺在 inbox.nextTurn 排队等当前回合结束才被取走执行。 */
+	function isQueuedSending(t) {
+		if (t.status !== "dispatched" || !t.messageId) return false;
+		try {
+			const agent = ctx.agents.get(t.sessionId);
+			if (!agent?.inbox) return false;
+			return agent.inbox.locate(t.messageId) !== undefined;
+		} catch { return false; }
+	}
+
+	/**
+	 * 取消任务 (命令/工具/RPC 共用):
+	 *   - pending: 排队中 → 直接取消 (转正会话归档/专属会话 dispose, 原逻辑)
+	 *   - dispatched + 消息仍在收件箱 (v0.5.0): 已派发但目标会话正忙, 消息在
+	 *     inbox 排队未执行 —— 视为"排队中"可取消: 标记 cancelled + Inbox.remove
+	 *     撤回消息 (与 GUI 会话消息队列编辑同一持久化原语, 纯删除, 会话不会执行)。
+	 *   - dispatched + 消息已被 claim 进会话历史: 已开始执行, 不可取消 (删除=改写历史)。
+	 */
 	async function cancelTask(state, id) {
-		const t = state.tasks.find((x) => x.id === id && x.status === "pending");
-		if (!t) return { kind: "error", text: `未找到排队中的任务 #${id}` };
-		t.status = "cancelled";
-		let removed = false;
-		if (t.taskSession && t.sessionId) {
-			await disposeTaskSession(t.sessionId);
-			removed = true;
-		} else if (t.ownSession && t.sessionId) {
-			const only = state.tasks.filter((x) => x.status === "pending" && x.sessionId === t.sessionId).length === 1;
-			if (only) {
-				try {
-					await ctx.get?.("workspaceRegistry")?.archiveSession(t.sessionId);
-					removed = true;
-				} catch (err) {
-					ctx.logger?.warn?.(`dsh-taskqueue: 归档任务 #${id} 会话失败: ${String(err?.message ?? err)}`);
+		const t = state.tasks.find((x) => x.id === id);
+		if (!t) return { kind: "error", text: `未找到任务 #${id}` };
+		if (t.status === "cancelled") return { kind: "error", text: `任务 #${id} 已取消` };
+		if (t.status === "dispatched") {
+			try {
+				const agent = ctx.agents.get(t.sessionId);
+				if (t.messageId && agent?.inbox && agent.inbox.remove(t.messageId)) {
+					t.status = "cancelled";
+					t.cancelledAt = new Date().toISOString();
+					return { kind: "success", text: `任务 #${id} 已取消 (派发消息仍在排队, 已撤回, 会话不会执行)` };
+				}
+			} catch (err) {
+				ctx.logger?.warn?.(`dsh-taskqueue: 撤回任务 #${id} 派发消息失败: ${String(err?.message ?? err)}`);
+			}
+			return { kind: "error", text: `任务 #${id} 已派发并开始执行 (或绑定会话离线), 无法取消` };
+		}
+		if (t.status === "pending") {
+			t.status = "cancelled";
+			t.cancelledAt = new Date().toISOString();
+			let removed = false;
+			if (t.taskSession && t.sessionId) {
+				await disposeTaskSession(t.sessionId);
+				removed = true;
+			} else if (t.ownSession && t.sessionId) {
+				const only = state.tasks.filter((x) => x.status === "pending" && x.sessionId === t.sessionId).length === 1;
+				if (only) {
+					try {
+						await ctx.get?.("workspaceRegistry")?.archiveSession(t.sessionId);
+						removed = true;
+					} catch (err) {
+						ctx.logger?.warn?.(`dsh-taskqueue: 归档任务 #${id} 会话失败: ${String(err?.message ?? err)}`);
+					}
 				}
 			}
+			return { kind: "success", text: `任务 #${id} 已取消${removed ? " (任务会话已移出列表)" : ""}` };
 		}
-		return { kind: "success", text: `任务 #${id} 已取消${removed ? " (任务会话已移出列表)" : ""}` };
+		return { kind: "error", text: `任务 #${id} 状态异常, 无法取消` };
 	}
 
 	// ---------- 派发 ----------
@@ -588,21 +625,23 @@ export async function apply(ctx, config) {
 			case "list": {
 				const state = await readState();
 				const pending = state.tasks.filter((t) => t.status === "pending");
-				const rest2 = state.tasks.filter((t) => t.status !== "pending");
+				const queued = state.tasks.filter((t) => isQueuedSending(t)); // v0.5.0: 已派发未执行也算排队中
+				const rest2 = state.tasks.filter((t) => t.status !== "pending" && !isQueuedSending(t));
+				const queueN = pending.length + queued.length;
 				const windowsNow = await resolveWindows();
 				const peak = isBeijingPeak(windowsNow);
 				// v0.4.3: 横幅文字精简 (历史移到面板底部), openPanel=true 出现即展开手风琴
 				appendQueueBanner(invocation?.agent?.session, {
 					openPanel: true,
-					title: `任务队列 · 排队中 ${pending.length} 个`,
+					title: `任务队列 · 排队中 ${queueN} 个`,
 					lines: [
-						pending.length === 0
+						queueN === 0
 							? "(队列为空)"
-							: `排队中 ${pending.length} 个 / 历史 ${rest2.length} 个`,
-						"任务列表见下方面板: 点行展开可 编辑/取消/立即派发"
+							: `排队中 ${queueN} 个 / 历史 ${rest2.length} 个`,
+						"任务列表见下方面板: 点行展开可 编辑/取消/立即派发 (已派发未执行的也可取消)"
 					]
 				});
-				return { kind: "success", text: `任务队列: ${pending.length} 排队中 / ${rest2.length} 历史 (详情见横幅面板)` };
+				return { kind: "success", text: `任务队列: ${queueN} 排队中 / ${rest2.length} 历史 (详情见横幅面板)` };
 			}
 			case "cancel": {
 				const id = parseInt(rest, 10);
@@ -616,7 +655,7 @@ export async function apply(ctx, config) {
 						title: `任务 #${id} 已取消`,
 						lines: t ? [`内容: ${t.content}`] : []
 					});
-					return { kind: "success", text: `任务 #${id} 已取消` };
+					return { kind: "success", text: r.text };
 				});
 			}
 			case "edit": {
@@ -667,7 +706,7 @@ export async function apply(ctx, config) {
 					"/queue add <内容>                   入队(绑当前会话), 等低谷自动执行",
 					"/queue add --at \"HH:mm\" <内容>    指定时间执行 (HH:mm 或 YYYY-MM-DD HH:mm)",
 					"/queue list                         查看队列(含各任务绑定会话)",
-					"/queue cancel <id>                  取消任务(任务会话移出列表)",
+					"/queue cancel <id>                  取消任务(排队中/已派发未执行的均可取消)",
 					"/queue edit <id> <新内容>           修改任务内容",
 					"/queue run-now <id>                 立即派发(不等低谷)",
 					"/queue target [会话id]              查看/设置兜底派发目标会话",
@@ -731,26 +770,28 @@ export async function apply(ctx, config) {
 			const windowsNow = await resolveWindows();
 			const peak = isBeijingPeak(windowsNow);
 			const pending = state.tasks.filter((t) => t.status === "pending");
-			const done = state.tasks.filter((t) => t.status !== "pending");
+			const queued = state.tasks.filter((t) => isQueuedSending(t)); // v0.5.0
+			const done = state.tasks.filter((t) => t.status !== "pending" && !isQueuedSending(t));
+			const queueN = pending.length + queued.length;
 			// v0.4.3: 横幅文字精简 (历史移到面板底部), openPanel=true 出现即展开手风琴
 			appendQueueBanner(exec?.agent?.session, {
 				openPanel: true,
-				title: `任务队列 · 排队中 ${pending.length} 个`,
+				title: `任务队列 · 排队中 ${queueN} 个`,
 				lines: [
-					pending.length === 0
+					queueN === 0
 						? "(队列为空)"
-						: `排队中 ${pending.length} 个 / 历史 ${done.length} 个`,
-					"任务列表见下方面板: 点行展开可 编辑/取消/立即派发"
+						: `排队中 ${queueN} 个 / 历史 ${done.length} 个`,
+					"任务列表见下方面板: 点行展开可 编辑/取消/立即派发 (已派发未执行的也可取消)"
 				]
 			});
-			return { text: `任务队列: ${pending.length} 排队中 / ${done.length} 历史 (详情见横幅面板)` };
+			return { text: `任务队列: ${queueN} 排队中 / ${done.length} 历史 (详情见横幅面板)` };
 		},
 		presentCall: () => ({ card: "generic", title: "查看任务队列", kind: "other" })
 	}));
 
 	ctx.tools.register(defineTool({
 		name: "queue_cancel",
-		description: "取消排队中的任务(按 id)",
+		description: "取消任务(按 id; 排队中的, 或已派发但派发消息仍在目标会话排队未执行的均可取消, 已开始执行的无法取消)",
 		parameters: { id: { type: "integer", required: true, description: "任务 id" } },
 		output: {
 			schema: { type: "object", additionalProperties: false, properties: { text: { type: "string", required: true } } },
@@ -855,6 +896,7 @@ export async function apply(ctx, config) {
 					content: t.content,
 					status: t.status,
 					statusText: STATUS_TEXT[t.status] ?? t.status,
+					queuedSending: isQueuedSending(t), // v0.5.0: 已派发且消息仍在收件箱排队 (可撤回)
 					createdAt: t.createdAt,
 					scheduledAt: t.scheduledAt ?? null,
 					sessionShort: shortSession(t.sessionId),
