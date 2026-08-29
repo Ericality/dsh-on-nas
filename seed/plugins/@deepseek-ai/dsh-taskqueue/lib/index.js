@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -10,6 +11,11 @@ import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
  * 客户端任务队列:
  *   - 不着急的需求先丢进队列, 到"低谷时段"(官方价半价窗口)自动派发给 agent 执行;
  *   - 也可以指定时间执行 (--at);
+ *   - 也可以指定"容器重启后"执行 (--on restart / when="restart", v0.6.0): 容器每次
+ *     重启后的首个 tick 自动派发, 每次重启只尝试一次 (派发失败保持排队,
+ *     下次重启再试 —— "已重启未发送又重启, 则再次重启后发送");
+ *     重启检测基于 /proc/1/stat 的 PID1 starttime 变化 (容器重启必然新进程),
+ *     状态文件持久化 lastBootId 记录上次已处理的重启。
  *   - 派发前可随时查看/修改/取消。
  *
  * 低谷时段判定: 每次从官方定价页解析"高峰时段为北京时间..."定义
@@ -54,6 +60,7 @@ import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
  * 斜杠命令:
  *   /queue add <内容>                   入队, 绑当前会话, 等低谷自动执行
  *   /queue add --at "HH:mm|YYYY-MM-DD HH:mm" <内容>   指定时间执行
+ *   /queue add --on restart <内容>     容器重启后自动执行 (v0.6.0)
  *   /queue list                         查看队列
  *   /queue cancel <id>                  取消
  *   /queue edit <id> <新内容>           修改内容
@@ -81,6 +88,22 @@ const DISPATCH_TRAILING_HINT =
 
 // 内置兜底 (2026-08-23 官方: 周一至周五 9-12/14-18 高峰, 其余空闲)
 const FALLBACK_WINDOWS = { weekdaysOnly: true, windows: [[9, 12], [14, 18]] };
+
+// ---------- 容器重启检测 (v0.6.0) ----------
+// "重启后发送"时机: 任务在容器重启后的首个 tick 自动派发。
+// 检测依据: 容器重启 = PID1 (dsh-entrypoint) 是全新进程 → /proc/1/stat 的
+// starttime (第22字段) 必然变化; host 的 boot_id 不随容器重启变化, 不可用。
+// 解析: 先按 ")" 切分 (comm 可能含空格/括号), 再取剩余字段第 20 个 (0-based 19)。
+// 返回 null 表示无法读取 (此时跳过重启触发检测, 不误派发)。
+function readBootId() {
+	try {
+		const s = readFileSync("/proc/1/stat", "utf8");
+		const starttime = s.split(")")[1]?.trim().split(/\s+/)[19];
+		return starttime ? `pid1:${starttime}` : null;
+	} catch {
+		return null;
+	}
+}
 
 // ---------- 官方页解析: 高峰窗口定义 ----------
 async function fetchPeakWindows() {
@@ -312,15 +335,21 @@ export async function apply(ctx, config) {
 	// 产生真实 turn/start → 侧边栏可见、离开不消失、不会被 connectWorkspace 当
 	// 新会话复用。确认 turn 只回一句"已创建, 等待派发", 不执行任何操作。
 	// config.ownSession=true 时保留 v0.3.0 行为: 排队即新建专属会话。
-	async function enqueueTask({ state, id, content, at, agent }) {
+	async function enqueueTask({ state, id, content, at, when, agent }) {
 		const session = agent?.session;
 		const sessionId = agent?.id ?? session?.id ?? null;
 		const task = {
 			id, content, createdAt: new Date().toISOString(), status: "pending",
 			...(sessionId ? { sessionId } : {}),
-			...(at ? { scheduledAt: at } : {})
+			...(at ? { scheduledAt: at } : {}),
+			// v0.6.0: when="restart" → 容器重启后派发 (trigger 字段, 不入 scheduledAt)
+			...(when === "restart" ? { trigger: "restart" } : {})
 		};
-		const when = at ? `于 ${beijingNowString(new Date(at))}` : "等低谷时段自动执行";
+		const whenText = at
+			? `于 ${beijingNowString(new Date(at))}`
+			: when === "restart"
+				? "容器重启后"
+				: "等低谷时段自动执行";
 		if (cfg.ownSession) {
 			// 专属会话模式 (默认关闭): 排队时新建独立会话
 			const cwd = session?.header?.cwd;
@@ -369,9 +398,9 @@ export async function apply(ctx, config) {
 		appendQueueBanner(session, {
 			openPanel: true,
 			title: `任务 #${id} 已入队`,
-			lines: [`执行: ${when}`, `内容: ${content}`]
+			lines: [`执行: ${whenText}`, `内容: ${content}`]
 		});
-		return { id, when };
+		return { id, when: whenText };
 	}
 
 	/** v0.5.0: 已派发且派发消息仍在目标会话收件箱排队 (未被 claim 执行) —— "排队发送中",
@@ -564,15 +593,31 @@ export async function apply(ctx, config) {
 			const state = await readState();
 			const windowsNow = await resolveWindows();
 			const now = Date.now();
+			// v0.6.0: 容器重启检测 —— PID1 starttime 变化 = 发生一次重启。
+			// trigger=restart 的任务只在"检测到重启的这一次 tick"派发 (尝试一次;
+			// 派发失败保持 pending, 下次重启再试 —— 满足"已重启未发送又重启,
+			// 再次重启后发送"); 尝试后消费事件 (更新 lastBootId 落盘)。
+			const bootId = readBootId();
+			const restartDetected = bootId !== null && state.lastBootId !== bootId;
+			if (bootId === null) ctx.logger?.warn?.("dsh-taskqueue: 无法读取容器启动标识 (/proc/1/stat), 跳过重启触发检测");
 			// 1) 派发到期任务 (pending); v0.4.3: 编辑锁中的任务 (及同会话后续任务) 跳过
 			cleanupStaleLocks(state);
 			const due = state.tasks.filter((t) => t.status === "pending"
-				&& (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !isBeijingPeak(windowsNow))
+				&& (t.trigger === "restart"
+					? restartDetected
+					: (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !isBeijingPeak(windowsNow)))
 				&& !isTaskLocked(state, t));
 			for (const task of due) {
 				const agent = await findTargetAgent(state, task);
 				if (!agent) continue; // 该任务无可用会话, 下次再试
 				await dispatchTask(state, task, agent);
+			}
+			// 消费重启事件: 无论 restart 任务是否全部派发成功, 都更新 lastBootId,
+			// 防止后续 tick 重复触发 (派发失败的任务保持 pending, 等下次重启再试)
+			if (restartDetected) {
+				state.lastBootId = bootId;
+				await writeState(state);
+				ctx.logger?.info?.(`dsh-taskqueue: 检测到容器重启 (bootId=${bootId}), restart 触发任务 ${due.filter((t) => t.trigger === "restart").length} 个到期(失败保持排队等下次重启)`);
 			}
 			// 2) 校验已派发任务: 派发超过 REDISPATCH_GRACE_MS 且消息已丢失(典型:
 			//    派发后未消费就遇容器重启, dispose 清空 inbox) -> 重新派发
@@ -607,18 +652,25 @@ export async function apply(ctx, config) {
 			switch (sub) {
 			case "add": {
 				let at = null;
+				let on = null;
 				let content = rest;
 				const atMatch = /^--at\s+("[^"]*"|'[^']*'|\S+)\s*(.*)$/.exec(rest);
+				const onMatch = /^--on\s+("[^"]*"|'[^']*'|\S+)\s*(.*)$/.exec(rest);
+				if (atMatch && onMatch) return { kind: "error", text: "--at 与 --on 不能同时使用" };
 				if (atMatch) {
 					at = parseAt(atMatch[1].replace(/^["']|["']$/g, ""));
 					content = atMatch[2];
+				} else if (onMatch) {
+					on = onMatch[1].replace(/^["']|["']$/g, "");
+					content = onMatch[2];
 				}
-				if (!content) return { kind: "error", text: "用法: /queue add [--at \"HH:mm\"] <内容>" };
+				if (!content) return { kind: "error", text: "用法: /queue add [--at \"HH:mm\" | --on restart] <内容>" };
 				if (rest.includes("--at") && !at) return { kind: "error", text: "--at 时间格式无效 (HH:mm 或 YYYY-MM-DD HH:mm, 且需为未来)" };
+				if (on !== null && on !== "restart") return { kind: "error", text: "--on 目前仅支持 restart (容器重启后派发)" };
 				return await mutateState(async (state) => {
 					const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
 					// v0.3.1: 任务绑当前会话; blank 会话走极简确认 turn 转正
-					const r = await enqueueTask({ state, id, content, at, agent: invocation?.agent });
+					const r = await enqueueTask({ state, id, content, at, when: on, agent: invocation?.agent });
 					return { kind: "success", text: `任务 #${r.id} 已入队` };
 				});
 			}
@@ -705,6 +757,7 @@ export async function apply(ctx, config) {
 				return { kind: "success", text: [
 					"/queue add <内容>                   入队(绑当前会话), 等低谷自动执行",
 					"/queue add --at \"HH:mm\" <内容>    指定时间执行 (HH:mm 或 YYYY-MM-DD HH:mm)",
+					"/queue add --on restart <内容>     容器重启后自动执行 (每次重启尝试一次, 失败等下次重启)",
 					"/queue list                         查看队列(含各任务绑定会话)",
 					"/queue cancel <id>                  取消任务(排队中/已派发未执行的均可取消)",
 					"/queue edit <id> <新内容>           修改任务内容",
@@ -722,10 +775,11 @@ export async function apply(ctx, config) {
 	// ---------- 模型工具 (不依赖客户端斜杠命令, 自然语言即可调用) ----------
 	ctx.tools.register(defineTool({
 		name: "queue_add",
-		description: "把任务加入低谷时段任务队列(任务绑定当前会话执行): 默认等官方低谷价时段(动态解析官方页)自动派发到当前会话执行, 也可用 at 指定时间(北京时区 HH:mm 或 YYYY-MM-DD HH:mm)",
+		description: "把任务加入低谷时段任务队列(任务绑定当前会话执行): 默认等官方低谷价时段(动态解析官方页)自动派发到当前会话执行, 也可用 at 指定时间(北京时区 HH:mm 或 YYYY-MM-DD HH:mm), 或用 when=\"restart\" 指定容器重启后自动派发",
 		parameters: {
 			content: { type: "string", required: true, description: "任务内容" },
-			at: { type: "string", description: "可选指定时间: HH:mm 或 YYYY-MM-DD HH:mm (北京时区)" }
+			at: { type: "string", description: "可选指定时间: HH:mm 或 YYYY-MM-DD HH:mm (北京时区)" },
+			when: { type: "string", description: "可选发送时机: restart=容器重启后自动派发 (每次重启尝试一次, 失败等下次重启; 默认缺省=等低谷时段自动派发)" }
 		},
 		output: {
 			schema: {
@@ -741,10 +795,11 @@ export async function apply(ctx, config) {
 		execute: async (args, exec) => {
 			const at = args.at ? parseAt(args.at) : null;
 			if (args.at && !at) throw new Error("at 时间格式无效 (HH:mm 或 YYYY-MM-DD HH:mm, 且需为未来)");
+			if (args.when && args.when !== "restart") throw new Error("when 仅支持 restart (容器重启后派发)");
 			return await mutateState(async (state) => {
 				const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
 				// v0.3.1: 任务绑当前会话; blank 会话走极简确认 turn 转正
-				const r = await enqueueTask({ state, id, content: args.content, at, agent: exec?.agent });
+				const r = await enqueueTask({ state, id, content: args.content, at, when: args.when, agent: exec?.agent });
 				return { id: r.id, text: `任务 #${r.id} 已入队` };
 			});
 		},
@@ -899,10 +954,13 @@ export async function apply(ctx, config) {
 					queuedSending: isQueuedSending(t), // v0.5.0: 已派发且消息仍在收件箱排队 (可撤回)
 					createdAt: t.createdAt,
 					scheduledAt: t.scheduledAt ?? null,
+					trigger: t.trigger ?? null, // v0.6.0: "restart" = 容器重启后派发
 					sessionShort: shortSession(t.sessionId),
-					whenText: t.scheduledAt
-						? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
-						: (peak ? "等低谷" : "低谷中"),
+					whenText: t.trigger === "restart"
+						? "等待容器重启"
+						: (t.scheduledAt
+							? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
+							: (peak ? "等低谷" : "低谷中")),
 					locked: isTaskLocked(state, t) // v0.4.3: 编辑锁标记 (客户端显示"编辑中")
 				}));
 				return { ok: true, value: {
