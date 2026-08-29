@@ -61,6 +61,7 @@ import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
  *   /queue add <内容>                   入队, 绑当前会话, 等低谷自动执行
  *   /queue add --at "HH:mm|YYYY-MM-DD HH:mm" <内容>   指定时间执行
  *   /queue add --on restart <内容>     容器重启后自动执行 (v0.6.0)
+ *   /queue add -r <内容>               同 --on restart (v0.6.1, iOS 单横线简写)
  *   /queue list                         查看队列
  *   /queue cancel <id>                  取消
  *   /queue edit <id> <新内容>           修改内容
@@ -656,17 +657,22 @@ export async function apply(ctx, config) {
 				let content = rest;
 				const atMatch = /^--at\s+("[^"]*"|'[^']*'|\S+)\s*(.*)$/.exec(rest);
 				const onMatch = /^--on\s+("[^"]*"|'[^']*'|\S+)\s*(.*)$/.exec(rest);
-				if (atMatch && onMatch) return { kind: "error", text: "--at 与 --on 不能同时使用" };
+				// v0.6.1: -r = --on restart 的单横线简写 (iOS 上 -- 难输入); 无需再打 restart
+				const rMatch = /^-r\s+(.*)$/.exec(rest);
+				if ((atMatch && onMatch) || ((atMatch || onMatch) && rMatch)) return { kind: "error", text: "--at / --on / -r 只能同时用一个" };
 				if (atMatch) {
 					at = parseAt(atMatch[1].replace(/^["']|["']$/g, ""));
 					content = atMatch[2];
 				} else if (onMatch) {
 					on = onMatch[1].replace(/^["']|["']$/g, "");
 					content = onMatch[2];
+				} else if (rMatch) {
+					on = "restart";
+					content = rMatch[1];
 				}
-				if (!content) return { kind: "error", text: "用法: /queue add [--at \"HH:mm\" | --on restart] <内容>" };
+				if (!content || /^(?:--at|--on|-r)$/.test(rest.trim())) return { kind: "error", text: "用法: /queue add [--at \"HH:mm\" | --on restart | -r] <内容>" };
 				if (rest.includes("--at") && !at) return { kind: "error", text: "--at 时间格式无效 (HH:mm 或 YYYY-MM-DD HH:mm, 且需为未来)" };
-				if (on !== null && on !== "restart") return { kind: "error", text: "--on 目前仅支持 restart (容器重启后派发)" };
+				if (on !== null && on !== "restart") return { kind: "error", text: "--on/-r 目前仅支持 restart (容器重启后派发)" };
 				return await mutateState(async (state) => {
 					const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
 					// v0.3.1: 任务绑当前会话; blank 会话走极简确认 turn 转正
@@ -758,6 +764,7 @@ export async function apply(ctx, config) {
 					"/queue add <内容>                   入队(绑当前会话), 等低谷自动执行",
 					"/queue add --at \"HH:mm\" <内容>    指定时间执行 (HH:mm 或 YYYY-MM-DD HH:mm)",
 					"/queue add --on restart <内容>     容器重启后自动执行 (每次重启尝试一次, 失败等下次重启)",
+					"/queue add -r <内容>               同 --on restart (iOS 单横线简写)",
 					"/queue list                         查看队列(含各任务绑定会话)",
 					"/queue cancel <id>                  取消任务(排队中/已派发未执行的均可取消)",
 					"/queue edit <id> <新内容>           修改任务内容",
