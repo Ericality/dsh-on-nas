@@ -29,9 +29,16 @@ if [ "${DSH_DEPLOY_PLUGINS:-0}" = "1" ] && [ -d /opt/dsh-seed ] && [ ! -f /data/
   echo ">> 播种完成 (标记 /data/dsh/.seeded, 后续重启不再释放)"
 fi
 
-# dsh web 只监听回环 (官方禁止 0.0.0.0), 端口 3081 避免与对外端口冲突
-dsh web --port 3081 &
+# dsh web 只监听回环 (官方禁止 0.0.0.0), 端口 3081 避免与对外端口冲突。
+# --no-open: 容器内无浏览器, 禁止 dsh web 每次启动尝试打开默认浏览器 (异常源之一)。
+dsh web --port 3081 --no-open &
 dsh_pid=$!
+
+# ---- ssh 别名全局生效: ssh 客户端按 passwd 家目录 (/root/.ssh/config) 读配置,
+# 不读 $HOME 指定的 /data/dsh/.ssh/config → 软链让 `ssh ubuntu-vm` 等别名可用。
+# (2026-08-29 排查"密码错误"根因时发现; 软链在容器层, 重建镜像后由本行重建)
+mkdir -p /root/.ssh
+ln -sfn /data/dsh/.ssh/config /root/.ssh/config
 
 # 可选: 生成自签名证书, 启用 8443 HTTPS 端口
 if [ -n "${HTTPS_ACCESS_HOST:-}" ]; then

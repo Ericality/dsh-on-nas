@@ -37,7 +37,28 @@ const MAX_FAILS = 5;          // 同 IP 失败次数上限
 const LOCK_MS = 60 * 1000;    // 锁定时长
 const BODY_LIMIT = 64 * 1024; // 登录请求体上限
 
-const secret = crypto.randomBytes(32).toString('hex');
+// ---------- 会话签名密钥 (持久化) ----------
+// 2026-08-30 修复: 原实现每次进程启动随机生成密钥 → 容器一重启(崩溃自动拉起/部署优雅重启)
+// 所有已签发 Cookie 验签全失败, 所有用户被迫重新登录。改为持久化密钥文件:
+//   优先级: 环境变量 DSH_AUTH_SECRET > 密钥文件 /data/dsh/.auth-secret (首次生成, chmod 600) > 内存随机兜底。
+const SECRET_FILE = process.env.DSH_AUTH_SECRET_FILE || '/data/dsh/.auth-secret';
+function loadOrCreateSecret() {
+  if (process.env.DSH_AUTH_SECRET) return process.env.DSH_AUTH_SECRET;
+  try {
+    if (fs.existsSync(SECRET_FILE)) {
+      const s = fs.readFileSync(SECRET_FILE, 'utf8').trim();
+      if (s.length >= 32) return s;
+    }
+    const s = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(SECRET_FILE, s, { mode: 0o600 });
+    return s;
+  } catch (e) {
+    // 无法读写密钥文件 (只读环境等) 时退回内存随机: 功能可用但重启后会掉登录
+    console.error('[auth] 无法持久化会话密钥 (回退内存随机, 重启后将要求重新登录):', e.message);
+    return crypto.randomBytes(32).toString('hex');
+  }
+}
+const secret = loadOrCreateSecret();
 const authOn = USER !== '' && PASS !== '';
 
 // ---------- 会话 ----------
@@ -194,13 +215,24 @@ function proxy(req, res) {
     delete opts.headers[h];
   }
   const preq = http.request(opts, (pres) => {
+    // 下游(浏览器)已断开则直接中止上游, 不再索要数据
+    if (res.destroyed || res.writableEnded) { preq.destroy(); return; }
     res.writeHead(pres.statusCode, pres.headers);
     pres.pipe(res);
+    // 上游(web)响应异常中断 → 关下游
+    pres.on('error', () => res.destroy());
   });
   preq.on('error', () => {
+    // 上游不可达/中断: 未发响应头则回 502, 否则关下游
     if (!res.headersSent) { res.writeHead(502, { 'Content-Type': 'text/plain' }); res.end('502 Bad Gateway: upstream dsh web not reachable'); }
-    else res.end();
+    else res.destroy();
   });
+  // 下游(浏览器)断开/异常 → 就地消化 EPIPE/ECONNRESET (不再 unhandled 崩溃),
+  // 并中止上游请求, 避免 dsh web 持续向无人读取的连接写数据; 连接关闭走 dsh web
+  // 官方正常路径, 不会影响其它进行中的回合。
+  res.on('error', () => preq.destroy());
+  res.on('close', () => { if (!res.writableFinished) preq.destroy(); });
+  req.on('error', () => preq.destroy());
   req.pipe(preq);
 }
 
@@ -236,6 +268,13 @@ function handleUpgrade(req, socket, head) {
     upSocket.write(head);
     upSocket.pipe(socket);
     socket.pipe(upSocket);
+    // 任一端断开/异常 → 消化 EPIPE/ECONNRESET (不再 unhandled 崩溃) 并关闭另一端;
+    // 断开传导到 dsh web 走 WS 官方正常关闭路径, 不影响其它回合。
+    const teardown = () => { upSocket.destroy(); socket.destroy(); };
+    upSocket.on('error', teardown);
+    socket.on('error', teardown);
+    upSocket.on('close', () => socket.destroy());
+    socket.on('close', () => upSocket.destroy());
   });
   wreq.on('error', () => socket.destroy());
   wreq.end();
