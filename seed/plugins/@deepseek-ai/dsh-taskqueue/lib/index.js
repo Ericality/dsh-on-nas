@@ -176,14 +176,19 @@ async function writeState(state) {
 	}
 }
 
-// ---------- 错峰出行模式状态 (v0.7.0) ----------
-// 独立状态文件 (与队列任务状态分离, 设置项不随队列滚动): { enabled: boolean }
+// ---------- 错峰出行模式状态 (v0.7.0 / v0.8.0) ----------
+// 独立状态文件 (与队列任务状态分离, 设置项不随队列滚动):
+//   { enabled: boolean, exempt: { [sessionId]: true } }
+//   v0.8.0 新增 exempt: 单会话豁免 map —— 豁免会话高峰时段照常发送 (客户端拦截器放行)。
 async function readMode() {
 	try {
 		const m = JSON.parse(await readFile(MODE_FILE, "utf8"));
-		return { enabled: m?.enabled === true };
+		return {
+			enabled: m?.enabled === true,
+			exempt: (m?.exempt && typeof m.exempt === "object" && !Array.isArray(m.exempt)) ? m.exempt : {}
+		};
 	} catch {
-		return { enabled: false };
+		return { enabled: false, exempt: {} };
 	}
 }
 
@@ -1062,27 +1067,50 @@ export async function apply(ctx, config) {
 				});
 			}
 			// ── v0.7.0 错峰出行模式 ────────────────────────────────────────────
-			// mode.get   → { enabled, peak, windowSource }  当前开关 + 实时高峰状态
-			// mode.set   { enabled }                         持久化开关 (写 MODE_FILE)
-			// add        { content, sessionId }              客户端拦截后入队 (绑指定会话,
-			//                                                 与 queue_add 工具同路径, 零 token)
+			// mode.get    → { enabled, peak, windowSource, exempt }  当前开关 + 实时高峰状态 + 豁免 map
+			// mode.set    { enabled }                               持久化开关 (写 MODE_FILE, 保留 exempt)
+			// mode.exempt { sessionId, exempt } (v0.8.0)            单会话豁免切换 (高峰照常发送)
+			// add         { content, sessionId }                    客户端拦截后入队 (绑指定会话,
+			//                                                        与 queue_add 工具同路径, 零 token)
 			case "mode.get": {
 				const mode = await readMode();
 				const windowsNow = await resolveWindows();
 				return { ok: true, value: {
 					enabled: mode.enabled,
 					peak: isBeijingPeak(windowsNow),
-					windowSource
+					windowSource,
+					exempt: mode.exempt
 				} };
 			}
 			case "mode.set": {
 				const enabled = payload?.enabled === true;
-				await writeMode({ enabled });
+				const cur = await readMode();
+				await writeMode({ enabled, exempt: cur.exempt });
 				const windowsNow = await resolveWindows();
 				return { ok: true, value: {
 					enabled,
 					peak: isBeijingPeak(windowsNow),
-					windowSource
+					windowSource,
+					exempt: cur.exempt
+				} };
+			}
+			case "mode.exempt": {
+				const sessionId = typeof payload?.sessionId === "string" ? payload.sessionId : "";
+				const exempt = payload?.exempt === true;
+				if (!sessionId) {
+					return { ok: false, error: { code: "bad-request", message: "需要 sessionId(当前会话)" } };
+				}
+				const cur = await readMode();
+				const exemptMap = { ...cur.exempt };
+				if (exempt) exemptMap[sessionId] = true;
+				else delete exemptMap[sessionId];
+				await writeMode({ enabled: cur.enabled, exempt: exemptMap });
+				const windowsNow = await resolveWindows();
+				return { ok: true, value: {
+					enabled: cur.enabled,
+					peak: isBeijingPeak(windowsNow),
+					windowSource,
+					exempt: exemptMap
 				} };
 			}
 			case "add": {
