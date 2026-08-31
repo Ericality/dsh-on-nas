@@ -76,6 +76,9 @@ export const name = "dsh-taskqueue";
 export const inject = ["commands", "agents", "tools", "connection"];
 
 const STATE_FILE = "/data/dsh/taskqueue.json";
+// v0.7.0: 错峰出行模式 (offpeak mode) —— 设置里开启后, 高峰期间所有用户消息
+// (已有/新会话) 默认入队 (客户端把 session.prompt 转成 /queue RPC add), 平峰/关闭时正常发送。
+const MODE_FILE = "/data/dsh/offpeak-mode.json";
 const PRICING_PAGE_URL = "https://api-docs.deepseek.com/zh-cn/quick_start/pricing";
 const WINDOW_CACHE_TTL_MS = 30 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60000;
@@ -167,6 +170,26 @@ async function readState() {
 async function writeState(state) {
 	try {
 		await writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// ---------- 错峰出行模式状态 (v0.7.0) ----------
+// 独立状态文件 (与队列任务状态分离, 设置项不随队列滚动): { enabled: boolean }
+async function readMode() {
+	try {
+		const m = JSON.parse(await readFile(MODE_FILE, "utf8"));
+		return { enabled: m?.enabled === true };
+	} catch {
+		return { enabled: false };
+	}
+}
+
+async function writeMode(mode) {
+	try {
+		await writeFile(MODE_FILE, JSON.stringify(mode, null, 2), "utf8");
 		return true;
 	} catch {
 		return false;
@@ -336,9 +359,10 @@ export async function apply(ctx, config) {
 	// 产生真实 turn/start → 侧边栏可见、离开不消失、不会被 connectWorkspace 当
 	// 新会话复用。确认 turn 只回一句"已创建, 等待派发", 不执行任何操作。
 	// config.ownSession=true 时保留 v0.3.0 行为: 排队即新建专属会话。
-	async function enqueueTask({ state, id, content, at, when, agent }) {
+	async function enqueueTask({ state, id, content, at, when, agent, sessionId: explicitSessionId }) {
 		const session = agent?.session;
-		const sessionId = agent?.id ?? session?.id ?? null;
+		// v0.7.0: RPC add (客户端错峰拦截) 无 agent 但带明确 sessionId → 优先用显式会话绑定
+		const sessionId = explicitSessionId ?? agent?.id ?? session?.id ?? null;
 		const task = {
 			id, content, createdAt: new Date().toISOString(), status: "pending",
 			...(sessionId ? { sessionId } : {}),
@@ -1035,6 +1059,47 @@ export async function apply(ctx, config) {
 				return await mutateState(async (state) => {
 					if (state.locks) delete state.locks[id];
 					return { ok: true, value: { id } };
+				});
+			}
+			// ── v0.7.0 错峰出行模式 ────────────────────────────────────────────
+			// mode.get   → { enabled, peak, windowSource }  当前开关 + 实时高峰状态
+			// mode.set   { enabled }                         持久化开关 (写 MODE_FILE)
+			// add        { content, sessionId }              客户端拦截后入队 (绑指定会话,
+			//                                                 与 queue_add 工具同路径, 零 token)
+			case "mode.get": {
+				const mode = await readMode();
+				const windowsNow = await resolveWindows();
+				return { ok: true, value: {
+					enabled: mode.enabled,
+					peak: isBeijingPeak(windowsNow),
+					windowSource
+				} };
+			}
+			case "mode.set": {
+				const enabled = payload?.enabled === true;
+				await writeMode({ enabled });
+				const windowsNow = await resolveWindows();
+				return { ok: true, value: {
+					enabled,
+					peak: isBeijingPeak(windowsNow),
+					windowSource
+				} };
+			}
+			case "add": {
+				const content = typeof payload?.content === "string" ? payload.content.trim() : "";
+				const sessionId = typeof payload?.sessionId === "string" ? payload.sessionId : null;
+				if (!content) {
+					return { ok: false, error: { code: "bad-request", message: "需要 content(非空字符串)" } };
+				}
+				if (!sessionId) {
+					return { ok: false, error: { code: "bad-request", message: "需要 sessionId(当前会话)" } };
+				}
+				return await mutateState(async (state) => {
+					const id = state.tasks.length ? Math.max(...state.tasks.map((t) => t.id)) + 1 : 1;
+					// 绑客户端传来的会话: 先查 live agent (有则走完整入队含转正/横幅), 无则仅绑会话 id
+					const agent = ctx.agents?.get?.(sessionId) ?? null;
+					const r = await enqueueTask({ state, id, content, at: null, when: null, agent, sessionId });
+					return { ok: true, value: { id: r.id, when: r.when } };
 				});
 			}
 			default:

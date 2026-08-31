@@ -1,12 +1,30 @@
 {
   "name": "@deepseek-ai/dsh-taskqueue",
-  "version": "0.6.1",
-  "description": "Client-level task queue: dump non-urgent ideas, auto-execute during off-peak (cheap) windows, at set times, or right after a container restart (--on restart / -r / when=\"restart\" (v0.6.1 adds the single-dash -r alias for iOS), detected via PID1 starttime change, one attempt per restart); v0.4.0 adds /queue RPC channel (list/edit/cancel/runnow) for the editable queue panel in dsh-notice-banner; v0.5.0 adds queued-sending state (dispatched but still waiting in target session inbox) that remains cancelable — cancel withdraws the queued message via Inbox.remove (local helper plugin, not an official package)",
+  "version": "0.7.0",
+  "description": "Client-level task queue: dump non-urgent ideas, auto-execute during off-peak (cheap) windows, at set times, or right after a container restart (--on restart / -r / when=\"restart\" (v0.6.1 adds the single-dash -r alias for iOS), detected via PID1 starttime change, one attempt per restart); v0.4.0 adds /queue RPC channel (list/edit/cancel/runnow) for the editable queue panel in dsh-notice-banner; v0.5.0 adds queued-sending state (dispatched but still waiting in target session inbox) that remains cancelable — cancel withdraws the queued message via Inbox.remove; v0.7.0 adds off-peak travel mode (错峰出行模式): when enabled in settings, all messages sent during peak hours are auto-queued via /queue RPC add instead of reaching the LLM — client bundle intercepts session.prompt (local helper plugin, not an official package)",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./package.json": "./package.json"
   },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-conversation",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib"
+  ],
   "license": "BSD-3-Clause"
 }
