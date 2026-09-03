@@ -7,7 +7,7 @@ window.__ModuleLoader__.load({
 		var { createSnapshotStore } = require("@deepseek-ai/dsh-client-runtime/client");
 
 		// ═══════════════════════════════════════════════════════════════════
-		// dsh-taskqueue 客户端 (v0.7.0 新增 / v0.8.0 提示换位 + 单会话豁免 / v0.8.1 药丸窄屏缩短)
+		// dsh-taskqueue 客户端 (v0.7.0 新增 / v0.8.0 提示换位 + 单会话豁免 / v0.8.2 折叠图标+弹层)
 		//
 		// 1) 错峰出行模式 (offpeak mode):
 		//    - 设置菜单「本地插件」列新增「任务队列」卡: 开关 + 当前状态显示
@@ -19,15 +19,13 @@ window.__ModuleLoader__.load({
 		//    - 斜杠命令不走 session.prompt (走 commands.execute), 天然不受拦截。
 		//    - v0.8.0 单会话豁免: 服务端持久化 exempt map (offpeak-mode.json),
 		//      豁免会话高峰照常发送; 拦截器命中条件加 !exempt[sessionId]。
-		// 2) 提示位置 (v0.8.0): 取代 v0.7.0 输入框上方悬浮状态条 (conversation.input.dock),
-		//    移入输入框底部工具行 Full access 选择器右侧 (conversation.input.left 槽):
-		//    紧凑药丸 —— 高峰琥珀「高峰 · 自动入队」+「本会话立即发送」小开关 (豁免);
-		//    豁免绿 / 平峰绿「平峰 · 正常发送」(无开关); 模式关闭不渲染。
-		//    输入框边框随状态着色 (:has() 纯 CSS, 高峰琥珀 / 豁免绿; 平峰不着色)。
-		//    v0.8.1 (2026-09-02): 药丸文案拆 完整(.dsh-tq-full) + 状态词(.dsh-tq-short) 双 span
-		//    —— 视口 ≤640px (手机) 只显示状态词「高峰/平峰/豁免」(圆点+豁免小开关保留, 宽屏
-		//    完整文案不变); 同时药丸自身可收缩 (min-width:0 + 文字省略号兜底), 窄行内不再
-		//    溢出与左右元素重叠 (手机端 mobile-nav 会把工具行改 nowrap 并压缩各元素)。
+		// 2) 提示位置 (v0.8.0→v0.8.2): conversation.input.left 槽 (Full access 选择器右侧):
+		//    - v0.8.2 触发器: 宽屏=完整文案药丸(button); 窄屏(≤640px)=26×26 小图标
+		//      (同左边 access 收缩, 解决手机端药丸/状态词仍与左右元素重叠的问题);
+		//      点击药丸/图标 → 弹层 (fixed + JS 摆位): 状态圆点+完整文案+说明 +
+		//      高峰「本会话立即发送」豁免开关 (开关自 v0.8.2 起统一收进弹层);
+		//    - 输入框边框随状态着色 (:has() 纯 CSS, 高峰琥珀 / 豁免绿; 平峰不着色);
+		//      模式关闭不渲染任何触发器。
 		// ═══════════════════════════════════════════════════════════════════
 
 		var NS = "ui-taskqueue";
@@ -49,10 +47,12 @@ window.__ModuleLoader__.load({
 			pillPeak: "高峰 · 自动入队",
 			pillExempt: "本会话立即发送",
 			pillOffpeak: "平峰 · 正常发送",
-			// v0.8.1 窄屏状态词 (≤640px 只显示这部分)
-			pillPeakShort: "高峰",
-			pillExemptShort: "豁免",
-			pillOffpeakShort: "平峰",
+			// v0.8.2 弹层 (点击药丸/图标弹出的小菜单)
+			descPeak: "当前为高峰时段，发送的消息会自动入队，到低谷价时段再执行。",
+			descExempt: "本会话已豁免错峰：高峰时段消息也立即发送，不入队。",
+			descOffpeak: "当前为平峰时段，消息正常发送。",
+			popRowLabel: "本会话立即发送",
+			triggerAria: "错峰状态：%s（点击查看/操作）",
 			ariaLabel: "错峰出行模式开关",
 			switchAria: "本会话立即发送 (豁免错峰, 高峰照常发送)",
 			switchAriaOn: "本会话已豁免错峰, 高峰照常发送 (点击恢复自动入队)"
@@ -72,9 +72,11 @@ window.__ModuleLoader__.load({
 			pillPeak: "Peak · auto-queue",
 			pillExempt: "Send now (this session)",
 			pillOffpeak: "Off-peak · normal send",
-			pillPeakShort: "Peak",
-			pillExemptShort: "Exempt",
-			pillOffpeakShort: "Off-peak",
+			descPeak: "Peak hours now: messages you send are auto-queued and run in the next off-peak window.",
+			descExempt: "This session bypasses off-peak mode: messages send immediately even during peak hours.",
+			descOffpeak: "Off-peak now: messages send normally.",
+			popRowLabel: "Send now in this session",
+			triggerAria: "Off-peak status: %s (click to view / act)",
 			ariaLabel: "Off-peak travel mode toggle",
 			switchAria: "Send immediately in this session (bypass peak queue)",
 			switchAriaOn: "This session bypasses peak queue (click to restore auto-queue)"
@@ -97,26 +99,34 @@ window.__ModuleLoader__.load({
 			".dsh-tq-status[data-state=\"peak\"]{color:var(--dsw-alias-state-warn-primary,#f59e0b)}",
 			".dsh-tq-status[data-state=\"offpeak\"]{color:var(--dsw-alias-state-success-primary,#22c55e)}",
 			".dsh-tq-hint{font-size:12px;color:var(--dsw-alias-label-tertiary);margin:0}",
-			// v0.8.0 药丸 (Full access 行右侧, conversation.input.left)
-			".dsh-tq-pill{display:inline-flex;align-items:center;gap:5px;height:26px;padding:0 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary);font-size:11.5px;line-height:1;white-space:nowrap;cursor:default;user-select:none;flex:none;min-width:0;max-width:100%;overflow:hidden}",
-			".dsh-tq-pill .dsh-tq-dot{width:7px;height:7px;border-radius:50%;flex:none;background:currentColor}",
-			".dsh-tq-pill[data-state=\"peak\"]{color:var(--dsw-alias-state-warn-primary,#f59e0b);border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 12%,transparent)}",
-			".dsh-tq-pill[data-state=\"exempt\"],.dsh-tq-pill[data-state=\"offpeak\"]{color:var(--dsw-alias-state-success-primary,#22c55e);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 40%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 11%,transparent)}",
-			// v0.8.1 药丸文案: 完整(.dsh-tq-full) + 状态词(.dsh-tq-short) 双 span
-			// 文字容器可收缩+省略号兜底 (工具行被压缩时不溢出覆盖左右元素); ≤640px 只显状态词
+			// v0.8.2 触发器 (Full access 行右侧, conversation.input.left):
+			// 宽屏=完整文案药丸(.dsh-tq-pill, button) / 窄屏(≤640px)=26×26 图标(.dsh-tq-icon, 同 access 收缩);
+			// 点击任一 → 弹层 .dsh-tq-pop (fixed, JS 摆位): 状态点+完整文案+说明 + 高峰豁免开关
+			".dsh-tq-wrap{position:relative;display:inline-flex;align-items:center;flex:none;min-width:0;line-height:1}",
+			".dsh-tq-pill{display:inline-flex;align-items:center;gap:5px;box-sizing:border-box;height:26px;margin:0;padding:0 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:11.5px;line-height:1;white-space:nowrap;cursor:pointer;user-select:none;flex:none;min-width:0;max-width:100%;overflow:hidden}",
+			".dsh-tq-pill .dsh-tq-dot,.dsh-tq-icon .dsh-tq-dot,.dsh-tq-pop .dsh-tq-dot{width:7px;height:7px;border-radius:50%;flex:none;background:currentColor}",
 			".dsh-tq-pill .dsh-tq-txt{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-			".dsh-tq-pill .dsh-tq-full{display:inline}",
-			".dsh-tq-pill .dsh-tq-short{display:none}",
-			"@media (max-width:640px){.dsh-tq-pill .dsh-tq-full{display:none}.dsh-tq-pill .dsh-tq-short{display:inline}}",
-			// v0.8.0 药丸内小开关 (仅高峰显示: 关=自动入队 / 开=本会话豁免)
-			".dsh-tq-pill .dsh-tq-sw{position:relative;flex:none;width:28px;height:16px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-interactive-bg-hover);cursor:pointer;padding:0;transition:background .15s,border-color .15s}",
-			".dsh-tq-pill .dsh-tq-sw::after{content:\"\";position:absolute;top:1.5px;left:2px;width:11px;height:11px;border-radius:50%;background:var(--dsw-alias-label-primary-foreground,#fff);transition:transform .15s;box-shadow:0 1px 2px rgba(0,0,0,.3)}",
-			".dsh-tq-pill .dsh-tq-sw[data-on=\"true\"]{background:var(--dsw-alias-state-success-primary,#22c55e);border-color:transparent}",
-			".dsh-tq-pill .dsh-tq-sw[data-on=\"true\"]::after{transform:translateX(12px)}",
-			// v0.8.0 输入框边框随状态着色 (:has() 纯 CSS, 药丸在 composer 卡内 → 卡边框变色;
-			// 平峰不着色; 模式关闭无药丸自然不着色)
-			"[data-composer-card]:has(.dsh-tq-pill[data-state=\"peak\"]){border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 55%,transparent) !important}",
-			"[data-composer-card]:has(.dsh-tq-pill[data-state=\"exempt\"]){border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 50%,transparent) !important}"
+			".dsh-tq-pill[data-state=\"peak\"],.dsh-tq-icon[data-state=\"peak\"]{color:var(--dsw-alias-state-warn-primary,#f59e0b);border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 12%,transparent)}",
+			".dsh-tq-pill[data-state=\"exempt\"],.dsh-tq-pill[data-state=\"offpeak\"],.dsh-tq-icon[data-state=\"exempt\"],.dsh-tq-icon[data-state=\"offpeak\"]{color:var(--dsw-alias-state-success-primary,#22c55e);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 40%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 11%,transparent)}",
+			".dsh-tq-icon{display:none;align-items:center;justify-content:center;box-sizing:border-box;width:26px;height:26px;margin:0;padding:0;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary);font-family:inherit;cursor:pointer;flex:none}",
+			"@media (max-width:640px){.dsh-tq-pill{display:none}.dsh-tq-icon{display:inline-flex}}",
+			// 弹层内开关 (v0.8.2 起豁免开关统一收进弹层; 28×16 同 v0.8.0 药丸内小开关)
+			".dsh-tq-sw{position:relative;flex:none;width:28px;height:16px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-interactive-bg-hover);cursor:pointer;padding:0;transition:background .15s,border-color .15s}",
+			".dsh-tq-sw::after{content:\"\";position:absolute;top:1.5px;left:2px;width:11px;height:11px;border-radius:50%;background:var(--dsw-alias-label-primary-foreground,#fff);transition:transform .15s;box-shadow:0 1px 2px rgba(0,0,0,.3)}",
+			".dsh-tq-sw[data-on=\"true\"]{background:var(--dsw-alias-state-success-primary,#22c55e);border-color:transparent}",
+			".dsh-tq-sw[data-on=\"true\"]::after{transform:translateX(12px)}",
+			// 弹层 (fixed + JS 摆位; 点外/Esc 关闭)
+			".dsh-tq-pop{display:none;box-sizing:border-box;position:fixed;z-index:9999;width:240px;padding:10px 12px;border-radius:12px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);box-shadow:0 8px 32px rgba(0,0,0,.35);text-align:left}",
+			".dsh-tq-pop.dsh-tq-pop-open{display:block}",
+			".dsh-tq-pop-title{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;line-height:1.4;color:var(--dsw-alias-label-primary)}",
+			".dsh-tq-pop[data-state=\"peak\"] .dsh-tq-pop-title{color:var(--dsw-alias-state-warn-primary,#f59e0b)}",
+			".dsh-tq-pop[data-state=\"exempt\"] .dsh-tq-pop-title,.dsh-tq-pop[data-state=\"offpeak\"] .dsh-tq-pop-title{color:var(--dsw-alias-state-success-primary,#22c55e)}",
+			".dsh-tq-pop-desc{margin-top:6px;font-size:11.5px;line-height:1.55;color:var(--dsw-alias-label-secondary)}",
+			".dsh-tq-pop-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px;padding-top:9px;border-top:1px dashed var(--dsw-alias-border-l2);font-size:12px;color:var(--dsw-alias-label-primary)}",
+			// 输入框边框随状态着色 (:has() 纯 CSS, 药丸/图标任一在 composer 卡内即着色;
+			// 平峰不着色; 模式关闭无触发器自然不着色)
+			"[data-composer-card]:has(.dsh-tq-pill[data-state=\"peak\"],.dsh-tq-icon[data-state=\"peak\"]){border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 55%,transparent) !important}",
+			"[data-composer-card]:has(.dsh-tq-pill[data-state=\"exempt\"],.dsh-tq-icon[data-state=\"exempt\"]){border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 50%,transparent) !important}"
 		].join("");
 
 		function injectCss() {
@@ -290,58 +300,144 @@ window.__ModuleLoader__.load({
 			]);
 		}
 
-		// ---------- 输入框药丸 (v0.8.0, conversation.input.left: Full access 行右侧) ----------
-		// 高峰: 琥珀「高峰 · 自动入队」+ 小开关 (关) → 点开关 = 本会话豁免 (服务端持久化);
-		// 豁免: 绿「本会话立即发送」+ 开关 (开) → 点开关 = 恢复自动入队;
-		// 平峰: 绿「平峰 · 正常发送」无开关; 模式关闭/未加载: 不渲染。
+		// ---------- 输入框触发器 (v0.8.2, conversation.input.left: Full access 行右侧) ----------
+		// 宽屏: 完整文案药丸 (.dsh-tq-pill, button); 窄屏(≤640px): 26×26 图标 (.dsh-tq-icon,
+		// 同左边 access 收缩, 不挤占工具行 → 不再与左右元素重叠);
+		// 点击药丸/图标 → 弹层 .dsh-tq-pop (fixed + JS 摆位): 状态圆点+完整文案+说明 +
+		// 高峰时「本会话立即发送」豁免开关 (v0.8.2 起豁免开关统一收进弹层, 药丸内不再内嵌开关);
+		// 点外/Esc 关闭; 模式关闭/未加载: 不渲染。豁免切换仍走服务端 mode.exempt 持久化。
+		var POP_W = 240;
 		function TaskQueuePill(props) {
 			var t = props.t;
 			var state = props.useTaskQueue(function (s) { return s; });
-			// hooks 必须无条件调用 (Rules of Hooks): useRef 置于 early return 之前
+			// hooks 必须无条件调用 (Rules of Hooks): 全部置于 early return 之前
 			var busy = React.useRef(false);
-			if (!state.loaded || state.status !== "ready" || !state.enabled) return null;
+			var triggerRef = React.useRef(null);
+			var popRef = React.useRef(null);
+			var [open, setOpen] = React.useState(false);
+			var ready = !!(state.loaded && state.status === "ready" && state.enabled);
 			var session = props.session;
 			var sessionId = session && (session.id || session.sessionId);
-			if (!sessionId) return null;
-			var exempt = !!(state.exempt && state.exempt[sessionId] === true);
+			var exempt = !!(ready && sessionId && state.exempt && state.exempt[sessionId] === true);
 			var peak = state.peak === true;
+			var pillState = !ready ? "offpeak" : (exempt ? "exempt" : (peak ? "peak" : "offpeak"));
+			var label = !ready ? "" : (exempt ? t("pillExempt") : (peak ? t("pillPeak") : t("pillOffpeak")));
+			var desc = !ready ? "" : (exempt ? t("descExempt") : (peak ? t("descPeak") : t("descOffpeak")));
+			var aria = label ? t("triggerAria").replace("%s", label) : "";
 			function toggleExempt() {
-				if (busy.current || !props.setExempt) return;
+				if (busy.current || !props.setExempt || !sessionId) return;
 				busy.current = true;
 				props.setExempt(sessionId, !exempt).then(function () {
 					busy.current = false;
 				}, function () { busy.current = false; });
 			}
-			if (!peak) {
-				// 平峰: 绿色信息药丸, 无开关 (豁免状态仅在高峰时显示/可切)
-				return React.createElement("span", { className: "dsh-tq-pill", "data-state": "offpeak" }, [
-					React.createElement("span", { className: "dsh-tq-dot" }),
-					React.createElement("span", { className: "dsh-tq-txt" }, [
-						React.createElement("span", { className: "dsh-tq-full" }, t("pillOffpeak")),
-						React.createElement("span", { className: "dsh-tq-short" }, t("pillOffpeakShort"))
-					])
+			function toggleOpen() {
+				setOpen(function (v) { return !v; });
+			}
+			// 点外/Esc 关闭 (仅打开期间挂监听; capture 确保弹层内开关先于关闭判定)
+			React.useEffect(function () {
+				if (!open) return;
+				function onDocDown(ev) {
+					var trig = triggerRef.current;
+					var pop = popRef.current;
+					var node = ev && ev.target;
+					if ((trig && node && trig.contains(node)) || (pop && node && pop.contains(node))) return;
+					setOpen(false);
+				}
+				function onKey(ev) {
+					if (ev && ev.key === "Escape") setOpen(false);
+				}
+				document.addEventListener("pointerdown", onDocDown, true);
+				document.addEventListener("keydown", onKey, true);
+				return function () {
+					document.removeEventListener("pointerdown", onDocDown, true);
+					document.removeEventListener("keydown", onKey, true);
+				};
+			}, [open]);
+			// 摆位: fixed, 触发器上方水平居中 (越界自动收敛), 顶部放不下则改下方; 滚动/缩放重摆
+			React.useLayoutEffect(function () {
+				if (!open) return;
+				function place() {
+					var pop = popRef.current;
+					var trig = triggerRef.current;
+					if (!pop || !trig) return;
+					var r = trig.getBoundingClientRect();
+					var ph = pop.getBoundingClientRect().height || 120;
+					var vw = window.innerWidth || document.documentElement.clientWidth || 320;
+					var left = Math.max(8, Math.min(r.left + r.width / 2 - POP_W / 2, vw - POP_W - 8));
+					var top = r.top - ph - 8;
+					if (top < 8) top = r.bottom + 8;
+					pop.style.left = Math.round(left) + "px";
+					pop.style.top = Math.round(top) + "px";
+					pop.style.width = POP_W + "px";
+				}
+				place();
+				window.addEventListener("resize", place);
+				window.addEventListener("scroll", place, true);
+				return function () {
+					window.removeEventListener("resize", place);
+					window.removeEventListener("scroll", place, true);
+				};
+			}, [open, exempt, peak]);
+			if (!ready || !sessionId) return null;
+			var popEl = null;
+			if (open) {
+				var rows = [];
+				if (peak) {
+					rows.push(React.createElement("div", { className: "dsh-tq-pop-row", key: "sw" }, [
+						React.createElement("span", null, t("popRowLabel")),
+						React.createElement("button", {
+							type: "button",
+							className: "dsh-tq-sw",
+							role: "switch",
+							"aria-checked": exempt,
+							"aria-label": exempt ? t("switchAriaOn") : t("switchAria"),
+							"data-on": exempt ? "true" : "false",
+							disabled: busy.current ? true : false,
+							onClick: toggleExempt
+						})
+					]));
+				}
+				popEl = React.createElement("div", {
+					ref: popRef,
+					className: "dsh-tq-pop dsh-tq-pop-open",
+					"data-state": pillState,
+					role: "dialog",
+					"aria-label": label
+				}, [
+					React.createElement("div", { className: "dsh-tq-pop-title" }, [
+						React.createElement("span", { className: "dsh-tq-dot" }),
+						React.createElement("span", null, label)
+					]),
+					React.createElement("div", { className: "dsh-tq-pop-desc" }, desc),
+					rows
 				]);
 			}
-			// 高峰: 琥珀自动入队 / 绿豁免 + 小开关
-			var pillState = exempt ? "exempt" : "peak";
-			var pillText = exempt ? t("pillExempt") : t("pillPeak");
-			var pillShort = exempt ? t("pillExemptShort") : t("pillPeakShort");
-			return React.createElement("span", { className: "dsh-tq-pill", "data-state": pillState }, [
-				React.createElement("span", { className: "dsh-tq-dot" }),
-				React.createElement("span", { className: "dsh-tq-txt" }, [
-					React.createElement("span", { className: "dsh-tq-full" }, pillText),
-					React.createElement("span", { className: "dsh-tq-short" }, pillShort)
+			return React.createElement("span", { className: "dsh-tq-wrap", ref: triggerRef }, [
+				React.createElement("button", {
+					key: "pill",
+					type: "button",
+					className: "dsh-tq-pill",
+					"data-state": pillState,
+					"aria-label": aria,
+					"aria-expanded": open ? "true" : "false",
+					title: label,
+					onClick: toggleOpen
+				}, [
+					React.createElement("span", { className: "dsh-tq-dot" }),
+					React.createElement("span", { className: "dsh-tq-txt" }, label)
 				]),
 				React.createElement("button", {
+					key: "icon",
 					type: "button",
-					className: "dsh-tq-sw",
-					role: "switch",
-					"aria-checked": exempt,
-					"aria-label": exempt ? t("switchAriaOn") : t("switchAria"),
-					"data-on": exempt ? "true" : "false",
-					disabled: busy.current ? true : false,
-					onClick: toggleExempt
-				})
+					className: "dsh-tq-icon",
+					"data-state": pillState,
+					"aria-label": aria,
+					"aria-expanded": open ? "true" : "false",
+					title: label,
+					onClick: toggleOpen
+				}, React.createElement("span", { className: "dsh-tq-dot" })),
+				popEl
 			]);
 		}
 
@@ -357,7 +453,7 @@ window.__ModuleLoader__.load({
 			// 0) 错峰出行模式拦截 (session.prompt)
 			installPromptInterceptor(ctx, controller);
 
-			// 1) 输入框药丸 (v0.8.0): conversation.input.left —— 渲染在输入框底部工具行
+			// 1) 触发器 (v0.8.2): conversation.input.left —— 渲染在输入框底部工具行
 			//    Full access 选择器右侧 (原 v0.7.0 conversation.input.dock 悬浮状态条已移除)
 			ctx.slots.inject("conversation.input.left", function () {
 				return ctx.slots.register({
