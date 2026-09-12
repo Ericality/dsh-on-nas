@@ -57,6 +57,19 @@ const MFA_TOKEN_FILE = process.env.DSH_AUTH_MFA_TOKEN_FILE || '/data/dsh/.auth-m
 const QR_LIB = process.env.DSH_QR_LIB || '/data/dsh/vendor/qrcode-generator.js';
 const DEVICE_DAYS = parseInt(process.env.DSH_AUTH_DEVICE_DAYS || '90', 10);
 const PREAUTH_MS = 5 * 60 * 1000;
+// ---------- 登录一次性码 (2026-09-12, Stage 4: 「发到手机」) ----------
+// 回滚开关 (同 TOTP 风格): OTP_FILE 不存在, 或其中 `otpEnabled !== true` ⇒ **OTP 完全关闭**
+// (登录页不渲染发码按钮, `/login?step=code&action=send-otp` 返回 403 otp_disabled, 且**不创建该文件**)。
+// 运行期回滚: 把 otpEnabled 置 false 或删掉文件 ⇒ 下一请求即生效, 无需重启。
+// 契约: docs/任务记录/2026-09-12-通知中枢Stage4-契约与决策.md §1–§6 (唯一来源)
+const OTP_FILE = process.env.DSH_AUTH_OTP_FILE || '/data/dsh/.auth-otp.json';
+const OTP_TTL_MS = parseInt(process.env.DSH_AUTH_OTP_TTL_MS || String(PREAUTH_MS), 10);
+const OTP_MAX_TRIES = parseInt(process.env.DSH_AUTH_OTP_MAX_TRIES || '5', 10);
+const OTP_COOLDOWN_MS = parseInt(process.env.DSH_AUTH_OTP_COOLDOWN_MS || '60000', 10);
+const OTP_WINDOW_MS = parseInt(process.env.DSH_AUTH_OTP_WINDOW_MS || '300000', 10);
+const OTP_MAX_SENDS = parseInt(process.env.DSH_AUTH_OTP_MAX_SENDS || '3', 10);
+const OTP_TIMEOUT_MS = parseInt(process.env.DSH_AUTH_OTP_TIMEOUT_MS || '12000', 10);
+const OTP_ICON_URL = process.env.DSH_NOTIFY_ICON_URL || 'https://harness.ericality.com/dsh-icon-512.png';
 // 单 IP 累计失败档位 (用户要求"从 3 次开始、要狠"): 跨重启/跨锁期累加, 只在**跨档**时上锁
 const LOCK_TIERS = [
   { at: 3, ms: 5 * 60 * 1000, label: '5 分钟' },
@@ -680,6 +693,8 @@ const ALERT_SPEC = {
   'auth.unlocked': { group: 'DSH-安全', level: 'active' },
   'auth.new_device': { group: 'DSH-安全', level: 'timeSensitive' },
   'auth.mfa_changed': { group: 'DSH-安全', level: 'timeSensitive' },
+  // Stage 4 (2026-09-12): 登录一次性码。**只有本类型带 icon** (用户裁定⑤) ⇒ 其它 5 类 payload 逐字不变。
+  'auth.otp': { group: 'DSH-安全', level: 'timeSensitive', icon: OTP_ICON_URL },
 };
 function barkTitle(title) {   // `[DSH] ` 前缀幂等 (逐字复刻 R148-151: 判据是 `[DSH]` 含尾空格前的部分)
   const t = String(title ?? '').trim();
@@ -822,6 +837,7 @@ function sendBarkDevice(device, alert, done) {
   try { r = resolveBark(device.url); } catch { r = null; }
   if (r === null || r.key === '') { done(new Error('bark-url-unresolvable')); return; }
   // 字段顺序即字面量顺序 (逐字复刻 R313-321); `...own` 放最后 ⇒ URL 自带同名参数优先
+  // Stage 4: `icon` **只在 alert.icon 存在时**加 (即仅 auth.otp) ⇒ 既有 5 类 payload 逐字不变
   const payload = {
     device_key: r.key,
     title: alert.title,
@@ -829,8 +845,9 @@ function sendBarkDevice(device, alert, done) {
     group: alert.group,
     level: alert.level,
     isArchive: 1,
-    ...r.own,
   };
+  if (typeof alert.icon === 'string' && alert.icon !== '') payload.icon = alert.icon;
+  Object.assign(payload, r.own);
   postJson(r.endpoint, payload, ALERT_TIMEOUT_MS, done);
 }
 function sendSynologyDevice(device, alert, done) {
@@ -862,6 +879,236 @@ function sendAuthAlert(type, title, body) {
     }
   } catch (e) {
     audit('ALERT_FAIL', { type, error: e.message });
+  }
+}
+
+// ---------- 一次性码内核 (2026-09-12, Stage 4) ----------
+// 状态文件 `.auth-otp.json` (新文件, env DSH_AUTH_OTP_FILE): 0600 + 原子写 + 按 mtime 热加载。
+// 文件形状 (契约 §2): { version, otpEnabled, codes[], sent{ip:[ts]}, updatedAt }
+// 边界语义 (契约 §2.1, 逐条): 文件不存在/损坏 ⇒ 关闭且**不自动创建**; otpEnabled 非严格 true ⇒ 关闭;
+//   codes 逐元素过滤丢弃非法项; expiresAt 非有限数 ⇒ 视为已过期(0); sent[ip] 非法 ⇒ [];
+//   tighten() 必须在缓存短路**之前**; saver 直接落内存态 (禁止再调 loader)。
+let otpState = null;
+let otpMtime = -1;
+let otpCorruptAt = -1;
+let otpCorruptLogged = false;
+function emptyOtp() { return { version: 1, otpEnabled: false, codes: [], sent: {}, updatedAt: 0 }; }
+function loadOtp() {
+  const st = statSafe(OTP_FILE);
+  if (st === null) { otpState = emptyOtp(); otpMtime = -1; otpCorruptAt = -1; return otpState; }
+  tighten(OTP_FILE);   // 同 loadMfa/loadDevices: 收紧必须在缓存短路之前
+  if (otpState !== null && st.mtimeMs === otpMtime) return otpState;
+  const raw = readJsonFile(OTP_FILE);
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    // 损坏/非对象 ⇒ 同"不存在"(降级关闭); console.error 每进程只记一次, 审计每次损坏只记一次
+    if (st.mtimeMs !== otpCorruptAt) {
+      otpCorruptAt = st.mtimeMs;
+      if (!otpCorruptLogged) { otpCorruptLogged = true; console.error(`[auth] 一次性码状态文件损坏 (${OTP_FILE}) ⇒ OTP 降级为关闭`); }
+      audit('OTP_FAIL', { error: 'state-corrupt' });
+    }
+    otpState = emptyOtp(); otpMtime = st.mtimeMs; return otpState;
+  }
+  const codes = [];
+  if (Array.isArray(raw.codes)) {
+    for (const c of raw.codes) {
+      if (c === null || typeof c !== 'object' || Array.isArray(c)) continue;   // 非法元素静默丢弃
+      const hash = typeof c.hash === 'string' ? c.hash : '';
+      if (hash === '') continue;
+      codes.push({
+        hash,
+        salt: typeof c.salt === 'string' ? c.salt : '',
+        createdAt: Number.isFinite(c.createdAt) ? c.createdAt : 0,
+        expiresAt: Number.isFinite(c.expiresAt) ? c.expiresAt : 0,   // 非法 ⇒ 0 ⇒ 视为已过期 (安全侧)
+        usedAt: Number.isFinite(c.usedAt) ? c.usedAt : 0,
+        tries: Number.isFinite(c.tries) && c.tries > 0 ? Math.floor(c.tries) : 0,
+        ip: typeof c.ip === 'string' ? c.ip : '',
+        ua: typeof c.ua === 'string' ? c.ua : '',
+      });
+    }
+  }
+  const sent = {};
+  if (raw.sent !== null && typeof raw.sent === 'object' && !Array.isArray(raw.sent)) {
+    for (const [k, v] of Object.entries(raw.sent)) {
+      sent[k] = Array.isArray(v) ? v.filter((t) => Number.isFinite(t)) : [];   // 非法 ⇒ [] (由 60s 冷却兜底)
+    }
+  }
+  otpState = {
+    version: 1,
+    otpEnabled: raw.otpEnabled === true,   // 只有严格 true 才算开 (与 enabled 同风格)
+    codes,
+    sent,
+    updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : 0,
+  };
+  otpMtime = st.mtimeMs;
+  return otpState;
+}
+function saveOtp() {
+  try {
+    // ⚠ 同 saveDevices/saveLocks: 必须落**内存态本身** (在 saver 里调 loadOtp() 会在"文件尚不存在"
+    //   时重置缓存, 把本次刚生成的码吞掉 — Stage 2 缺陷 1 的教训)。
+    const cur = otpState !== null ? otpState : loadOtp();
+    writeJsonFile(OTP_FILE, cur);
+    otpMtime = statSafe(OTP_FILE)?.mtimeMs ?? -1;
+  } catch (e) { console.error('[auth] 一次性码状态写盘失败:', e.message); }
+}
+function otpOn() { return loadOtp().otpEnabled === true; }
+
+// 同步等待式告警 (契约 §3): 与既有 sendAuthAlert(fire-and-forget) **并存**, 既有 5 类调用点不变。
+// cb(err, okCount): 全成功或**部分成功**(okCount ≥ 1) ⇒ err=null; 全失败/零目标/超时 ⇒ err。
+function sendAuthAlertAwait(type, title, body, cb, timeoutMs) {
+  const limit = Number.isFinite(timeoutMs) ? timeoutMs : OTP_TIMEOUT_MS;
+  let finished = false;
+  const finish = (err, okCount) => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(timer);
+    try { cb(err === undefined ? null : err, okCount === undefined ? 0 : okCount); }
+    catch (e) { console.error('[auth] 等待式告警回调异常:', e.message); }
+  };
+  const timer = setTimeout(() => finish(new Error('timeout')), limit);
+  try {
+    const spec = ALERT_SPEC[type];
+    if (spec === undefined) { finish(new Error('unknown-type')); return; }
+    const hub = loadHub();
+    if (hub === null) { finish(new Error('no_notify_hub')); return; }   // 缺失/损坏 ⇒ 零请求, 不算失败
+    const ids = resolveRouteIds(hub, type);
+    const alert = { title: barkTitle(title), body, group: spec.group, level: spec.level, icon: spec.icon };
+    let pending = 0;
+    let ok = 0;
+    let firstErr = null;
+    const one = (id) => (err) => {
+      if (err !== null && err !== undefined) {
+        if (firstErr === null) firstErr = err;
+        audit('ALERT_FAIL', { type, device: id, error: err.message });   // 失败设备写审计 (契约 §3)
+      } else ok += 1;
+      pending -= 1;
+      if (pending <= 0) finish(ok >= 1 ? null : new Error(firstErr === null ? 'no_targets' : firstErr.message), ok);
+    };
+    for (const id of ids) {
+      const device = hub.byId.get(id);
+      if (device === undefined) continue;   // 停用/不存在 id 静默忽略 (与 fire-and-forget 同语义)
+      pending += 1;
+      const doneOne = one(id);
+      try {
+        if (device.kind === 'bark') sendBarkDevice(device, alert, doneOne);
+        else sendSynologyDevice(device, alert, doneOne);
+      } catch (e) { doneOne(e); }
+    }
+    if (pending === 0) finish(new Error('no_targets'));
+  } catch (e) { finish(e); }
+}
+
+// 一次性码校验 (登录提交侧, 契约 §4.3): 返回 { triesUsed } 或 null。
+// ⚠ **不在此处计失败次数**: 失败计数由调用方既有 failLogin ⇒ recordFail **恰一次** 完成 (F9: 防双计数)。
+// 码内状态变化: 失败 ⇒ tries+1, 达上限 ⇒ usedAt=now 作废 + OTP_TRIES_EXCEEDED 审计;
+//                成功 ⇒ usedAt=now 且作废该 IP 其余未用码。
+function verifyOtpCode(ip, ua, code) {
+  try {
+    const otp = loadOtp();
+    if (otp.otpEnabled !== true) return null;
+    const now = Date.now();
+    // 同 IP 至多保留 1 个未用码 (F10: 每次发码先作废旧码) ⇒ 取最后一个未过期未用码
+    const cand = otp.codes.filter((c) => c.ip === ip && c.usedAt === 0 && c.expiresAt > now);
+    if (cand.length === 0) return null;   // 无码/已过期/已用尽 ⇒ 直接拒 (不新建记录)
+    const rec = cand[cand.length - 1];
+    const norm = String(code || '').replace(/\D/g, '');
+    const hit = norm.length === 6 && safeEqualStr(rec.hash, hashRecovery(rec.salt, norm));
+    if (!hit) {
+      rec.tries += 1;   // 每次提交(含格式不符的错码)算一次尝试
+      if (rec.tries >= OTP_MAX_TRIES) {   // 达 5 次上限 ⇒ 立即作废
+        rec.usedAt = now;
+        otp.updatedAt = now;
+        saveOtp();
+        audit('OTP_TRIES_EXCEEDED', { ip, ua });
+      } else {
+        otp.updatedAt = now;
+        saveOtp();
+      }
+      return null;
+    }
+    const triesUsed = rec.tries + 1;
+    for (const c of otp.codes) if (c.ip === ip && c.usedAt === 0) c.usedAt = now;   // 用掉即废 + 作废该 IP 其余未用码
+    otp.updatedAt = now;
+    saveOtp();
+    return { triesUsed };
+  } catch (e) {
+    console.error('[auth] 一次性码校验异常:', e.message);
+    return null;
+  }
+}
+
+// 发码端点 (契约 §4.1 门禁顺序 ①–⑩ + §4.2 响应形状, 逐字)
+function handleSendOtp(req, res, ip) {
+  const ua = uaSummary(req);
+  const deny = (status, error, extra) => {
+    audit('OTP_FAIL', { ip, ua, error });
+    mfaReply(res, status, Object.assign({ ok: false, error }, extra || {}));
+  };
+  try {
+    // CSRF (同 /mfa/api): 浏览器路径若带 Origin, 其 host 必须与 Host 一致
+    const origin = req.headers.origin;
+    if (typeof origin === 'string' && origin !== '') {
+      let oh = '';
+      try { oh = new URL(origin).host; } catch { oh = ''; }
+      if (oh === '' || oh !== String(req.headers.host || '')) { deny(403, 'bad_origin'); return; }
+    }
+    const cfg = loadMfa();
+    if (cfg === null || cfg.enabled !== true) { deny(403, 'mfa_off'); return; }
+    if (!preauthOk(req, ip)) { deny(401, 'no_preauth'); return; }
+    const otp = loadOtp();
+    if (otp.otpEnabled !== true) { deny(403, 'otp_disabled'); return; }   // 关闭态: 不生成码/不写文件
+    const now = Date.now();
+    if (lockStatus(ip, now) !== null) { deny(423, 'locked'); return; }    // 锁定态: 不发码 (用户裁定④)
+    const sents = (Array.isArray(otp.sent[ip]) ? otp.sent[ip] : []).filter((t) => now - t < OTP_WINDOW_MS);
+    const last = sents.length > 0 ? Math.max(...sents) : 0;
+    if (last > 0 && now - last < OTP_COOLDOWN_MS) {   // ⑥ 冷却 (1 次/60s)
+      deny(429, 'cooldown', { retryInSec: Math.max(1, Math.ceil((OTP_COOLDOWN_MS - (now - last)) / 1000)) });
+      return;
+    }
+    if (sents.length >= OTP_MAX_SENDS) {   // ⑦ 窗口配额 (≤3 次/5 分钟)
+      const oldest = Math.min(...sents);
+      deny(429, 'rate_limited', { retryInSec: Math.max(1, Math.ceil((OTP_WINDOW_MS - (now - oldest)) / 1000)) });
+      return;
+    }
+    // ⑦.5 通道预检 (决策登记 D-OTP-6): hub 缺失/损坏 ⇒ **不生成码、不写状态文件、不占配额**,
+    //   直接 409 (契约 §4.2 "no_notify_hub ⇒ 不发"; 放在生成之前才能真正"不发")。
+    if (loadHub() === null) { deny(409, 'no_notify_hub'); return; }
+    // ⑧ 生成码 + 落盘 (文件里**只有哈希**; 明文仅在内存与下发通知里)
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+    const salt = crypto.randomBytes(16).toString('hex');
+    const rec = {
+      hash: hashRecovery(salt, code), salt,
+      createdAt: now, expiresAt: now + OTP_TTL_MS, usedAt: 0, tries: 0, ip, ua,
+    };
+    for (const c of otp.codes) if (c.ip === ip && c.usedAt === 0) c.usedAt = now;   // 旧码立即作废 (F10)
+    otp.codes = otp.codes.filter((c) => c.usedAt === 0 || now - c.usedAt < OTP_WINDOW_MS);
+    otp.codes.push(rec);
+    otp.sent[ip] = sents.concat([now]);
+    otp.updatedAt = now;
+    saveOtp();
+    // ⑨ 同步下发 (≤ OTP_TIMEOUT_MS; 用户必须知道"到底发出去没有")
+    const text = `登录一次性码：${code}\n5 分钟内有效，仅用于本次登录，用掉即失效。\nIP ${ip} · ${ua} · ${auditStamp()}`;
+    sendAuthAlertAwait('auth.otp', '🔐 登录验证码', text, (err, okCount) => {
+      if (err !== null) {
+        const msg = String(err.message || '');
+        if (msg === 'no_notify_hub' || msg === 'unknown-type') { deny(409, 'no_notify_hub'); return; }
+        deny(502, 'delivery_failed');   // 全设备失败或超时 (不计锁表失败次数)
+        return;
+      }
+      audit('OTP_SENT', { ip, ua, devices: String(okCount), ttlSec: String(Math.round(OTP_TTL_MS / 1000)) });
+      // ⑩ 成功响应
+      mfaReply(res, 200, {
+        ok: true,
+        sent: okCount,
+        ttlSec: Math.max(0, Math.round((rec.expiresAt - Date.now()) / 1000)),
+        nextInSec: Math.round(OTP_COOLDOWN_MS / 1000),
+        remainInWindow: Math.max(0, OTP_MAX_SENDS - otp.sent[ip].length),
+      });
+    });
+  } catch (e) {
+    // 零回归铁律: 任何异常都不得影响登录 ⇒ 只审计 + 502, 不抛出
+    audit('OTP_FAIL', { ip, ua, error: 'delivery_failed' });
+    try { mfaReply(res, 502, { ok: false, error: 'delivery_failed' }); } catch { /* 响应已发出 */ }
   }
 }
 
@@ -967,11 +1214,18 @@ function passwordCard(mfa, err, next) {
   </form>
   ${errBox(err)}`;
 }
-function codeCard(err, next) {
+function codeCard(err, next, otpReady) {
   const nq = next === '/mfa' ? '&next=/mfa' : '';   // 验证码态同样保留 next
   const cfg = loadMfa();
   const period = cfg === null ? 30 : cfg.period;
   const left = period - (Math.floor(Date.now() / 1000) % period);   // 当前 30s 窗口剩余秒数 (示意用)
+  // Stage 4 (契约 §5): `#otp-msg` 容器**必须始终存在** (关闭态为空且 hidden);
+  //   `#btn-send-otp` / `#otp-count` / `#otp-warn` **仅在** otpEnabled && !locked && mfa 时渲染。
+  const otpUi = otpReady === true
+    ? `<div class="ok" id="otp-msg" hidden></div>
+    <button type="button" id="btn-send-otp">📲 发送验证码到手机<span id="otp-count"></span></button>
+    <div class="warn" id="otp-warn">一次性码只在下发通知里显示，本页与日志都不会出现；用掉即失效</div>`
+    : `<div id="otp-msg" hidden></div>`;
   return `<h1>DeepSeek Harness</h1>
   <div class="ok" id="ok">✓ 密码已通过，请输入验证码</div>
   <form method="post" action="/login?step=code${nq}">
@@ -980,6 +1234,7 @@ function codeCard(err, next) {
            maxlength="12" placeholder="******" autofocus required>
     ${errBox(err)}
     ${err === '' ? '' : '<div class="warn">再次验证失败会临时锁定登录，请确认验证器时间后再试</div>'}
+    ${otpUi}
     <div class="timer">验证码有效剩余 <b id="ttl" data-period="${period}" data-left="${left}">${left}</b> 秒</div>
     <div class="hint" style="margin:10px 0 0;display:block">输入验证器 6 位验证码，或一次性恢复码</div>
     <button type="submit">验 证</button>
@@ -1032,14 +1287,63 @@ const TTL_JS = `
   }
   setTimeout(tick, 1000);
 })();`;
-// opts: { insecureLan, mfa, step:''|'code', err:0|1|2, lock:null|{ms,permanent}, next:''|'/mfa' }
+// 一次性码页内脚本 (Stage 4, 契约 §5): 仅在 otpEnabled && !locked && mfa 时才注入 (关闭态零新增节点/脚本)。
+// 文案用 textContent 赋值 (禁 innerHTML); 结果条沿用既有 .ok/.err 语义色; 倒计时 data-left 与文本同源。
+const OTP_JS = `
+(function () {
+  var btn = document.getElementById('btn-send-otp');
+  if (!btn) return;
+  var msg = document.getElementById('otp-msg');
+  var cnt = document.getElementById('otp-count');
+  var timer = null, until = 0;
+  function paint() {
+    var left = Math.ceil((until - Date.now()) / 1000);
+    if (left < 0) left = 0;
+    if (cnt) { cnt.textContent = left > 0 ? ' (' + left + 's)' : ''; cnt.setAttribute('data-left', String(left)); }
+    if (left <= 0) { if (timer) { clearInterval(timer); timer = null; } btn.disabled = false; }
+  }
+  function cooldown(sec) {
+    until = Date.now() + Math.max(1, sec) * 1000;
+    btn.disabled = true;
+    if (timer) clearInterval(timer);
+    paint();
+    timer = setInterval(paint, 100);   // 契约: 每 100ms 刷新
+  }
+  function show(cls, text) {
+    msg.className = cls;
+    msg.style.display = 'block';
+    msg.style.margin = '10px 0 0';
+    msg.textContent = text;
+  }
+  btn.addEventListener('click', function () {
+    if (btn.disabled) return;
+    btn.disabled = true;
+    var form = document.querySelector('form');
+    var url = (form ? form.getAttribute('action') : '/login?step=code') + '&action=send-otp';
+    fetch(url, { method: 'POST', credentials: 'same-origin' }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (d) { return d || {}; });
+    }).then(function (d) {
+      if (d.ok === true) { show('ok', '✅ 验证码已发送到你的设备，5 分钟内有效'); cooldown(parseInt(d.nextInSec || 60, 10)); return; }
+      btn.disabled = false;
+      var e = String(d.error || '');
+      if (e === 'cooldown' || e === 'rate_limited') { show('err', '⚠️ 发送过于频繁，请稍后重试'); cooldown(parseInt(d.retryInSec || 60, 10)); return; }
+      if (e === 'no_preauth') { show('err', '⚠️ 登录已超时，请返回重新输入密码'); return; }
+      if (e === 'locked') { show('err', '⚠️ 当前已锁定，暂不能发送验证码'); return; }
+      if (e === 'otp_disabled') { show('err', '⚠️ 一次性码已关闭，请用验证器或恢复码'); return; }
+      if (e === 'no_notify_hub') { show('err', '⚠️ 通知通道未配置，无法发送验证码'); return; }
+      if (e === 'delivery_failed') { show('err', '⚠️ 验证码发送失败，请重试或改用验证器'); return; }
+      show('err', '⚠️ 发送失败，请稍后重试');
+    }).catch(function () { btn.disabled = false; show('err', '⚠️ 网络异常，请稍后重试'); });
+  });
+})();`;
+// opts: { insecureLan, mfa, step:''|'code', err:0|1|2, lock:null|{ms,permanent}, next:''|'/mfa', otp:bool }
 function sendLogin(res, opts) {
   const o = opts || {};
   const locked = o.lock !== null && o.lock !== undefined;
   let card = '';
   let pageScript = '';
   if (locked) { card = lockCard(o.lock); pageScript = LOCK_JS; }
-  else if (o.step === 'code') { card = codeCard(o.err === 2 ? '验证码不正确，请重试' : '', o.next); pageScript = TTL_JS; }
+  else if (o.step === 'code') { card = codeCard(o.err === 2 ? '验证码不正确，请重试' : '', o.next, o.otp === true); pageScript = TTL_JS + (o.otp === true ? OTP_JS : ''); }
   else card = passwordCard(o.mfa === true, o.err === 1 ? '用户名或密码错误, 请重试' : '', o.next);
   const html = LOGIN_HTML
     .replace('__CARD__', card)
@@ -1169,7 +1473,13 @@ function genRecoveryCodes(n) {
   return out;
 }
 function otpauthUri(secret) {
-  return `otpauth://totp/DSH:${USER}?secret=${secret}&issuer=DSH&algorithm=SHA1&digits=6&period=30`;
+  // Stage 4 (2026-09-13, 用户要求「扫码后 otp 应用里也要有图标」): Key URI Format 的**可选** `image=`
+  //   参数 —— 属扩展而非强制件: Aegis / 2FAS / Ente Auth 等会显示该图标, Google / Microsoft /
+  //   Apple 验证器与 Authy 会忽略（不报错）。⚠️ **必须排在 `secret=` 之前**: 既有断言
+  //   `…secret=…&issuer=DSH&algorithm=SHA1&digits=6&period=30$` 逐字锚定结尾, 追加在尾部会失配。
+  //   取值用 PWA 同一张公开可取的图标（env DSH_NOTIFY_ICON_URL 可覆盖, 与推送 icon 同源）。
+  const img = encodeURIComponent(OTP_ICON_URL);
+  return `otpauth://totp/DSH:${USER}?image=${img}&secret=${secret}&issuer=DSH&algorithm=SHA1&digits=6&period=30`;
 }
 // seed/enable/regenerate 共同的返回形状 (契约 §2)
 function seedPayload(cfg, enabled) {
@@ -1541,6 +1851,8 @@ const MFA_CSS = `
   .secret { display: block; margin: 10px 0 4px; padding: 10px 12px; border-radius: 8px; background: rgba(255,255,255,.75);
             border: 1px solid rgba(0,0,0,.12); font-size: 15px; user-select: all; word-break: break-all; }
   #seed-qr svg { width: 168px; height: 168px; background: #fff; padding: 4px; border-radius: 8px; margin-top: 8px; }
+  /* Stage 4 (契约 §5 / 用户裁定⑤): 二维码卡片里的 DSH 品牌小图标; 图标缺失时 onerror 隐藏自身 (不破坏二维码降级路径) */
+  #seed-qr-brand { display: block; width: 20px; height: 20px; margin-top: 8px; border-radius: 5px; opacity: .9; }
   #recovery-list { margin: 6px 0 0 20px; font-size: 14px; }
   #recovery-list li { margin: 3px 0; }
   .empty { font-size: 12.5px; color: #666; line-height: 1.6; }
@@ -1771,6 +2083,7 @@ function mfaPage(st) {
     <summary id="btn-reveal-seed">显示种子与恢复码</summary>
     <div class="empty" style="margin-top:8px">种子与恢复码不会随首屏下发：点击上方标题后才从服务端读取。</div>
     <div id="seed-qr"></div>
+    <img id="seed-qr-brand" src="/dsh-icon-512.png" alt="DSH" width="20" height="20" aria-hidden="true" onerror="this.style.display='none'">
     <code class="secret mono" id="seed-secret"></code>
     <h2>一次性恢复码（各用一次，8 个）</h2>
     <ol id="recovery-list">${placeholders}</ol>
@@ -1942,6 +2255,13 @@ const handler = (req, res) => {
     //   密码态与验证码态的表单 action 都带上它, 完整认证走完后才跳转。
     const next = url.searchParams.get('next') === '/mfa' ? '/mfa' : '';
     const nextQ = next === '/mfa' ? '&next=/mfa' : '';
+    // Stage 4: 发码唯一入口 `POST /login?step=code&action=send-otp` (契约 §4.1)。
+    //   返回 JSON (非 303); 门禁顺序在 handleSendOtp 内逐条实现。非 POST ⇒ 405。
+    if (url.searchParams.get('action') === 'send-otp') {
+      if (req.method !== 'POST') { mfaReply(res, 405, { ok: false, error: 'method_not_allowed' }); return; }
+      handleSendOtp(req, res, ip);
+      return;
+    }
     if (req.method === 'POST') {
       const cfg = loadMfa();
       const lock = lockStatus(ip, now);
@@ -1977,9 +2297,11 @@ const handler = (req, res) => {
           res.end();
         };
         // 新设备过验证码 → 签发设备信任 + 告警 (恢复码登录也走这条, 正文标注)
+        let otpTriesUsed = 0;   // Stage 4: 一次性码登录时记录本次用掉前已错的次数 (审计 OTP_USED)
         const newDevice = (kind, cfg2) => {
           const dev = registerDevice(req, ip);
           audit(kind === 'recovery' ? 'MFA_RECOVERY_USED' : 'MFA_NEW_DEVICE', { ip, ua, device: dev.name });
+          if (kind === 'otp') audit('OTP_USED', { ip, ua, device: dev.name, triesUsed: String(otpTriesUsed) });
           sendAuthAlert('auth.new_device', '✅ 新设备登录通过',
             `IP ${ip} · ${ua} · ${auditStamp()}\n设备: ${dev.name}${kind === 'recovery' ? ' (使用恢复码)' : ''}`);
           success({ mfa: kind, deviceCookie: deviceCookieHeader(dev.id, cfg2.deviceEpoch) });
@@ -1992,9 +2314,18 @@ const handler = (req, res) => {
           // (否则会一直"验证码错误"并持续累计失败计数, 最终把用户锁死 —— 违背"绝不半途锁死")
           if (!mfa || cfg === null) { success({ mfa: 'off', audit: { note: 'mfa-disabled-midflow' } }); return; }
           const code = params.get('code') || '';
+          // Stage 4 (契约 §4.3): 先验证器/恢复码 (现状不动), 再一次性码; 任一通过 ⇒ 既有 newDevice 路径。
           const kind = verifyMfaCode(cfg, code);
-          if (kind === null) { audit('LOGIN_CODE_FAIL', { ip, ua, step: 'code' }); failLogin('验证码错误', `/login?step=code&err=2${nextQ}`); return; }
-          newDevice(kind, cfg);
+          if (kind !== null) { newDevice(kind, cfg); return; }
+          const otpRes = verifyOtpCode(ip, ua, code);
+          if (otpRes === null) {
+            // 失败共用同一条既有失败路径: 恰计 1 次 recordFail (F9: **禁止**为 OTP 另立计数器)
+            audit('LOGIN_CODE_FAIL', { ip, ua, step: 'code' });
+            failLogin('验证码错误', `/login?step=code&err=2${nextQ}`);
+            return;
+          }
+          otpTriesUsed = otpRes.triesUsed;
+          newDevice('otp', cfg);
           return;
         }
 
@@ -2031,7 +2362,8 @@ const handler = (req, res) => {
     if (lockGet !== null && trustedGet === null) { sendLogin(res, { insecureLan, lock: lockGet, next }); return; }
     if (step === 'code') {
       if (!preauthOk(req, ip)) { res.writeHead(302, { Location: '/login' }); res.end(); return; }
-      sendLogin(res, { insecureLan, mfa, step: 'code', err: errRaw === '2' ? 2 : 0, next });
+      // Stage 4: 按钮仅在 otpEnabled && !locked && mfa 时渲染 (契约 §5); 关闭态只多一个空的 hidden #otp-msg
+      sendLogin(res, { insecureLan, mfa, step: 'code', err: errRaw === '2' ? 2 : 0, next, otp: mfa && lockGet === null && otpOn() });
       return;
     }
     sendLogin(res, { insecureLan, mfa, err: errRaw === '1' ? 1 : 0, next });
@@ -2155,6 +2487,14 @@ process.on('SIGINT', shutdown);
       + ` 限速档=${LOCK_TIERS.map((t) => t.at).join('/')} 全站闸=${GLOBAL_MAX_FAILS}/h`
       + ` 锁表=${lockedIps} 个 IP${locks.global.lockUntil > Date.now() ? ' + 全站闸生效中' : ''}`
       + ` 告警设备=${hub === null ? '未配置' : String(hub.devices.filter((d) => d.enabled !== false).length)}`
-      + ` /mfa页=ON 管理令牌=${mfaToken === null ? 'OFF(仅cookie)' : 'ON'} 二维码=${qrLib === null ? 'OFF(手动输入)' : 'ON'}`);
+      + ` /mfa页=ON 管理令牌=${mfaToken === null ? 'OFF(仅cookie)' : 'ON'} 二维码=${qrLib === null ? 'OFF(手动输入)' : 'ON'}`
+      + (() => {   // Stage 4: 手机一次性码开关 (关闭态 = 回滚态, 行为回到 Stage 3)
+        const otp = loadOtp();
+        const otpOnNow = otp.otpEnabled === true;
+        return ` OTP=${otpOnNow ? 'ON' : 'OFF'}`
+          + (otpOnNow
+            ? ` (TTL ${Math.round(OTP_TTL_MS / 1000)}s, 尝试 ${OTP_MAX_TRIES} 次, 节流 ${Math.round(OTP_COOLDOWN_MS / 1000)}s/${OTP_MAX_SENDS}次每${Math.round(OTP_WINDOW_MS / 60000)}min, 待用码 ${otp.codes.filter((c) => c.usedAt === 0).length})`
+            : ` (${OTP_FILE} 不存在或 otpEnabled!==true ⇒ 登录页不显示发码按钮, send-otp 返回 403 otp_disabled)`);
+      })());
   } catch (e) { console.error('[auth] 安全内核启动自检失败:', e.message); }
 })();

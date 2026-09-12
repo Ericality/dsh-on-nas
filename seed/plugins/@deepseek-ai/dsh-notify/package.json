@@ -1,12 +1,29 @@
 {
   "name": "@deepseek-ai/dsh-notify",
-  "version": "0.5.4",
-  "description": "Task-completion push notifications (v0.5.4: ask_user_question-only question push, v0.5.3 format) to Synology Chat webhook / Bark",
+  "version": "0.8.1",
+  "description": "回合完成/提问/中断推送（逐项独立路由与开关）+ 通知中枢 (Bark 多设备 + 群晖 Chat, 类型路由 + options + 设置卡)",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
     ".": "./lib/index.js",
+    "./client": {
+      "default": "./lib/client.js"
+    },
     "./package.json": "./package.json"
   },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-store",
+        "@deepseek-ai/dsh-client-connection",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib"
+  ],
   "license": "BSD-3-Clause"
 }
