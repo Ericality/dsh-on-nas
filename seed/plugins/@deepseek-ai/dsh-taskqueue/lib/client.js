@@ -4,21 +4,29 @@ window.__ModuleLoader__.load({
 		var module = { exports: {} };
 		var exports = module.exports;
 		var React = require("react");
-		var { createSnapshotStore } = require("@deepseek-ai/dsh-client-runtime/client");
+		var { createSnapshotStore } = require("@deepseek-ai/dsh-client-store");
 
 		// ═══════════════════════════════════════════════════════════════════
-		// dsh-taskqueue 客户端 (v0.7.0 新增 / v0.8.0 提示换位 + 单会话豁免 / v0.8.2 折叠图标+弹层)
+		// dsh-taskqueue 客户端 (v0.7.0 新增 / v0.8.0 提示换位 + 单会话豁免 / v0.8.2 折叠图标+弹层 /
+		//                        v0.8.3 0.1.2 槽契约修复 + 诊断上报)
 		//
 		// 1) 错峰出行模式 (offpeak mode):
 		//    - 设置菜单「本地插件」列新增「任务队列」卡: 开关 + 当前状态显示
-		//    - 开启后高峰期间: 所有消息 (已有/新会话) 默认入队 —— 包装
-		//      connection.api.sessions.prompt, 当 开关开 + 当前高峰 + 纯文本时
-		//      不发给 LLM, 改调 /queue RPC add 入队 (绑当前会话, 服务端注入
-		//      蓝色队列横幅), 并向 composer 返回模拟成功 (accepted: true) 清空输入框。
+		//    - 开启后高峰期间: 所有消息 (已有/新会话) 默认入队 —— 包装会话对象的
+		//      prompt(content, mode, signal, requestId) (0.1.2 真实发送入口), 当
+		//      开关开 + 当前高峰 + 纯文本时 不发给 LLM, 改调 /queue RPC add 入队
+		//      (绑当前会话, 服务端注入蓝色队列横幅), 并向 composer 返回模拟成功
+		//      (accepted: true) 清空输入框。
 		//      平峰期间或关闭状态: 原样放行 (正常发送)。
 		//    - 斜杠命令不走 session.prompt (走 commands.execute), 天然不受拦截。
 		//    - v0.8.0 单会话豁免: 服务端持久化 exempt map (offpeak-mode.json),
 		//      豁免会话高峰照常发送; 拦截器命中条件加 !exempt[sessionId]。
+		//    - v0.8.3 修复 (2026-09-12): 0.1.2 的会话作用域槽 (conversation.input.left)
+		//      只给 props.sessionId + useSession hook (旧代码读 props.session → 药丸 return null,
+		//      且拦截器唯一兜底捕获一起失效 → 拦截器其实从未安装)。改为「sessions.list 订阅 +
+		//      useSession/槽参捕获 + 短时重试」三路捕获, 并加诊断上报 (window.__dshTaskqueueDebug
+		//      + /queue RPC diag → 服务端 log/taskqueue/offpeak-debug.log)。
+		//      强制时段 (调试): 服务端 debug=peak|offpeak 时状态文案标注 [强制 …·debug]。
 		// 2) 提示位置 (v0.8.0→v0.8.2): conversation.input.left 槽 (Full access 选择器右侧):
 		//    - v0.8.2 触发器: 宽屏=完整文案药丸(button); 窄屏(≤640px)=26×26 小图标
 		//      (同左边 access 收缩, 解决手机端药丸/状态词仍与左右元素重叠的问题);
@@ -139,12 +147,17 @@ window.__ModuleLoader__.load({
 			} catch (e) { /* 样式注入失败不影响功能 */ }
 		}
 
-		// ---------- 控制器: /queue RPC (mode.get/mode.set/mode.exempt) + store ----------
-		// 状态缓存: 高峰判定服务端 30min 缓存窗口, 客户端再缓存 60s 足够 (时段边界最多延迟 1 分钟)。
+		// ---------- 控制器: /queue RPC (mode.get/mode.set/mode.exempt/mode.debug/diag) + store ----------
+		// 状态缓存: 高峰判定服务端 30min 缓存窗口, 客户端 UI 侧缓存 60s 足够 (时段边界最多延迟 1 分钟)。
+		// v0.8.3: 拦截判定单独用更短的 TTL (PROMPT_TTL_MS) —— 强制时段/豁免开关切换后要在几秒内生效,
+		//   否则"刚 /queue debug peak 就发消息"会按旧的平峰状态直发 (用户以为没生效)。
+		//   UI 侧 15s 轮询刷新, 让药丸/设置卡也能较快跟随强制状态。
 		var STATUS_TTL_MS = 60 * 1000;
+		var PROMPT_TTL_MS = 5 * 1000;
+		var UI_POLL_MS = 15 * 1000;
 
 		function createController(connection) {
-			var store = createSnapshotStore({ status: "loading", loaded: false, enabled: false, peak: false, windowSource: "", exempt: {} });
+			var store = createSnapshotStore({ status: "loading", loaded: false, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {} });
 			var cached = null; // { at, value }
 			function call(endpoint, payload) {
 				var rpc = connection && connection.rpc;
@@ -157,6 +170,12 @@ window.__ModuleLoader__.load({
 					return { ok: false, error: { code: "transport", message: String((err && err.message) || err) } };
 				});
 			}
+			/** v0.8.3 诊断上报: 拦截器/药丸在浏览器里, 静默失效时只能靠它远程取证 (服务端落 log/taskqueue/) */
+			function report(event, detail) {
+				try {
+					return void call("diag", { event: event, detail: detail || {} });
+				} catch (e) { /* 诊断失败绝不影响功能 */ }
+			}
 			function publish(value) {
 				store.set({
 					status: "ready",
@@ -164,28 +183,33 @@ window.__ModuleLoader__.load({
 					enabled: value.enabled === true,
 					peak: value.peak === true,
 					windowSource: String(value.windowSource || ""),
+					peakSource: String(value.peakSource || value.windowSource || ""),
+					debug: String(value.debug || "auto"),
 					exempt: (value.exempt && typeof value.exempt === "object") ? value.exempt : {}
 				});
 			}
-			function refresh(force) {
-				if (!force && cached && Date.now() - cached.at < STATUS_TTL_MS) return Promise.resolve(cached.value);
+			function refresh(force, ttlMs) {
+				var ttl = typeof ttlMs === "number" ? ttlMs : STATUS_TTL_MS;
+				if (!force && cached && Date.now() - cached.at < ttl) return Promise.resolve(cached.value);
 				return call("mode.get", {}).then(function (res) {
 					if (res.ok) {
 						cached = { at: Date.now(), value: res.value };
 						publish(res.value);
 						return res.value;
 					}
-					store.set({ status: "error", loaded: true, enabled: false, peak: false, windowSource: "", exempt: {} });
+					store.set({ status: "error", loaded: true, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {} });
 					return null;
 				});
 			}
 			refresh(true);
-			// 周期性兜底刷新 (开关状态变化/时段切换), 不阻塞任何操作
-			setInterval(function () { void refresh(false); }, STATUS_TTL_MS);
+			// 周期性兜底刷新 (开关状态变化/时段切换/强制时段切换), 不阻塞任何操作
+			setInterval(function () { void refresh(false, UI_POLL_MS); }, UI_POLL_MS);
 			return {
 				store: store,
+				report: report,
 				refresh: refresh,
-				getStatus: function () { return refresh(false); },
+				// 拦截判定用短 TTL (v0.8.3): 强制时段/豁免切换 ≤5s 生效, 避免"以为没生效"
+				getStatus: function () { return refresh(false, PROMPT_TTL_MS); },
 				setEnabled: function (enabled) {
 					return call("mode.set", { enabled: enabled === true }).then(function (res) {
 						if (res.ok) {
@@ -210,47 +234,153 @@ window.__ModuleLoader__.load({
 			};
 		}
 
-		// ---------- 拦截: connection.api.sessions.prompt ----------
-		// 条件: 开关开 + 当前高峰 + 纯文本 (无图片) + 文本非空 + 本会话未豁免 (v0.8.0)。
-		// 命中 → /queue RPC add 入队 (绑当前会话, 服务端注入队列横幅) + 返回模拟成功,
-		//       composer 清空输入框 (消息不发送给 LLM, 零 token);
-		// 未命中 → 原样放行。斜杠命令走 commands.execute, 不经 session.prompt, 不受影响。
-		function installPromptInterceptor(ctx, controller) {
-			var connection = ctx.get("connection");
-			if (!connection || !connection.api || !connection.api.sessions) return;
-			var sessions = connection.api.sessions;
-			var origPrompt = sessions.prompt;
-			if (typeof origPrompt !== "function") return;
-			sessions.prompt = async function (payload, signal) {
+		// ---------- 拦截: 0.1.2 Session.prompt (2026-09-11 P3 适配 / 2026-09-12 修复) ----------
+		// 0.1.2 起 connection 服务只剩 { isLoopback, generation, state, rpc, reconnect,
+		// registerGenerationSource } —— **`connection.api` 已不存在**，旧代码
+		// `connection.api.sessions.prompt` 包装恒不执行 (guard 直接 return) → 错峰拦截静默失效。
+		// 真实发送链路: composer → 会话对象 `prompt(content, mode, signal, requestId)`
+		//   (content = [{type:"text",text}]|[{type:"image",...}]; 返回 { ok, value:{accepted} } 或 { ok:false, error })。
+		// 类本身未导出 ⇒ 用「已捕获实例的 prototype」包装 (WeakSet 去重, 一次包装覆盖所有会话)。
+		//
+		// ⚠️ 2026-09-12 修复: P3 的两条捕获路径在 0.1.2 下**都拿不到会话**, 拦截器从未安装且完全静默:
+		//   ① apply 发生在页面启动早期, `sessions.list` 快照的 current 仍是 undefined (seed 落空);
+		//   ② 唯一兜底 = 药丸槽 props.session —— 但 0.1.2 的 session 作用域槽只给
+		//      `props.sessionId` + `useSession` hook (源码: renderSlot("conversation.input.left", {})),
+		//      老代码读 props.session 恒 undefined → 药丸 return null → 兜底也没了。
+		//   现在三条并行捕获路径 (任一成功即完成原型包装), 且每一步都上报诊断:
+		//     a) 订阅 `sessions.list` (列表就绪/切换会话时补挂, 解决页面早期 current 为空);
+		//     b) 药丸渲染时用 useSession hook / 槽 inject 工厂第一参(会话 id) 捕获实例;
+		//     c) `window.__dshTaskqueueDebug` + /queue RPC diag (无浏览器控制台也能远程确认是否装上)。
+		var patchedPromptProtos = new WeakSet();
+		// controller 绑定键: 放在被包装原型的标记属性上 (每次 apply 重新指向当前 controller,
+		// 避免插件热重载/重复 apply 后旧 controller 的 60s 状态缓存残留)
+		var CTL_KEY = "__dshTaskqueueOffpeakCtl";
+		var captureSessionFn = null; // 由 installPromptInterceptor 赋值; 药丸/槽位渲染时把会话实例喂进来
+		var lastPillDiagKey = "";
+		// 诊断状态 (供 CDP/E2E 与用户自查: window.__dshTaskqueueDebug)
+		var debugState = { version: "0.8.3", installed: false, sessionId: null, lastEvent: null, lastAt: 0 };
+		try { window.__dshTaskqueueDebug = debugState; } catch (e) { /* 非浏览器环境忽略 */ }
+		function diag(controller, event, detail) {
+			debugState.lastEvent = event;
+			debugState.lastAt = Date.now();
+			debugState.detail = detail || {};
+			try {
+				if (typeof controller === "function") controller(event, detail || {});
+				else if (controller && typeof controller.report === "function") controller.report(event, detail || {});
+			} catch (e) { /* 诊断不影响功能 */ }
+		}
+		/** 取会话实例: sessions 服务优先 (不依赖是否已渲染), 兜底用槽位捕获到的实例 */
+		function acquireSession(ctx, sessionId, fallback) {
+			var sessions = ctx.get("sessions");
+			if (sessions && typeof sessions.binding === "function" && sessionId) {
 				try {
-					// 只拦截: 开关开 + 高峰 + 纯文本 (无图片) + 非空 + 本会话未豁免
-					var status = await controller.getStatus();
-					var content = Array.isArray(payload && payload.content) ? payload.content : [];
-					var hasImage = content.some(function (part) { return part && part.type === "image"; });
-					var text = content.filter(function (part) { return part && part.type === "text" && typeof part.text === "string"; }).map(function (part) { return part.text; }).join("").trim();
-					if (status && status.enabled === true && status.peak === true && !hasImage && text !== "") {
-						var sessionId = payload && payload.sessionId;
-						if (sessionId) {
-							// v0.8.0: 豁免会话 (服务端持久化 exempt map) 高峰照常发送
-							var exempt = !!(status.exempt && status.exempt[sessionId] === true);
-							if (!exempt) {
-								var res = await controller.addTask(text, sessionId);
-								if (res && res.ok) {
-									// 模拟 session.prompt 成功返回 (composer 清空输入框; 队列横幅由服务端注入)
-									return { rpcId: "offpeak-queued", result: { ok: true, value: { accepted: true } } };
+					var binding = sessions.binding(sessionId);
+					if (binding && binding.session) return binding.session;
+				} catch (e) { /* 未 scoped/未列出 → 走兜底 */ }
+			}
+			return fallback || null;
+		}
+		/**
+		 * 包装会话实例原型上的 prompt。返回 true 表示本次成功包装 (或已包装)。
+		 * 原方法签名 (0.1.2): (content, mode, signal, requestId)，用 variadic 转发保证不过期。
+		 */
+		function patchSessionPrompt(controller, session, why) {
+			if (!session) return false;
+			var proto = Object.getPrototypeOf(session);
+			if (!proto) return false;
+			// 同一原型只包装一次; controller 绑定放在原型标记属性上, 每次 apply 重新指向
+			// (插件热重载/重复 apply 时旧 controller 的 60s 状态缓存不会残留)
+			if (!patchedPromptProtos.has(proto)) {
+				var origPrompt = proto.prompt;
+				if (typeof origPrompt !== "function") {
+					diag(controller, "patch.no-prompt", { why: why, proto: String((proto.constructor && proto.constructor.name) || "?") });
+					return false;
+				}
+				proto.prompt = async function (content, mode, signal, requestId) {
+					var ctl = this[CTL_KEY];
+					try {
+						// 只拦截: 开关开 + 高峰 + 纯文本 (无图片) + 非空 + 本会话未豁免
+						var status = ctl ? await ctl.getStatus() : null;
+						if (status && status.enabled === true && status.peak === true) {
+							var parts = Array.isArray(content) ? content : [];
+							var hasImage = parts.some(function (p) { return p && p.type === "image"; });
+							var text = parts.filter(function (p) { return p && p.type === "text" && typeof p.text === "string"; })
+								.map(function (p) { return p.text; }).join("").trim();
+							var sessionId = this && (this.sessionId || this.id);
+							if (!hasImage && text !== "" && sessionId) {
+								// v0.8.0: 豁免会话 (服务端持久化 exempt map) 高峰照常发送
+								var exempt = !!(status.exempt && status.exempt[sessionId] === true);
+								if (!exempt) {
+									var res = await ctl.addTask(text, sessionId);
+									if (res && res.ok) {
+										diag(ctl, "hit.queued", { sessionId: sessionId, chars: text.length, debug: status.debug, taskId: res.value && res.value.id });
+										// 模拟 prompt 成功 (composer 清空输入框; 队列横幅由服务端注入, 消息不进 LLM)
+										return { ok: true, value: { accepted: true } };
+									}
+									diag(ctl, "hit.add-failed", { sessionId: sessionId, error: (res && res.error) || null });
+									// 入队失败 → 不静默吞消息, 回退正常发送
 								}
-								// 入队失败 → 不静默吞消息, 回退正常发送
 							}
 						}
-					}
-				} catch (e) { /* 任何异常都不拦截, 回退正常发送 */ }
-				return origPrompt(payload, signal);
-			};
-			ctx.effect(function () {
-				return function () {
-					try { sessions.prompt = origPrompt; } catch (e) { /* 恢复失败忽略 */ }
+					} catch (e) { diag(ctl, "hit.error", { error: String((e && e.message) || e) }); }
+					return origPrompt.call(this, content, mode, signal, requestId);
 				};
-			}, "dsh-taskqueue: prompt interceptor");
+				patchedPromptProtos.add(proto);
+				diag(controller, "interceptor.installed", { why: why });
+			}
+			try { proto[CTL_KEY] = controller; } catch (e) { return false; }
+			return true;
+		}
+		function installPromptInterceptor(ctx, controller) {
+			// 供药丸/槽位在渲染时把会话实例喂进来 (渲染必然早于发送)
+			captureSessionFn = function (s) {
+				if (!s) return false;
+				var sid = s.id || s.sessionId || null;
+				var inst = acquireSession(ctx, sid, s);
+				var ok = patchSessionPrompt(controller, inst, "capture");
+				if (ok) debugState.installed = true;
+				if (inst) debugState.sessionRef = inst; // 调试/E2E: 当前会话实例 (与 composer 发送同一对象)
+				if (sid && debugState.sessionId !== sid) {
+					debugState.sessionId = sid;
+					diag(controller, "session.captured", { sessionId: sid, hasInstance: !!inst, patched: ok });
+				}
+				return ok;
+			};
+			var sessions = null;
+			try { sessions = ctx.get("sessions"); } catch (e) { sessions = null; }
+			diag(controller, "apply", {
+				hasSessions: !!sessions,
+				hasList: !!(sessions && sessions.list),
+				hasBinding: !!(sessions && typeof sessions.binding === "function")
+			});
+			// a) 立即尝试 seed + 订阅会话列表 (current 出现/切换会话时补挂)
+			function seed() {
+				try {
+					var snap = sessions && sessions.list && sessions.list.getSnapshot && sessions.list.getSnapshot();
+					var id = snap && (snap.current || (snap.ids && snap.ids[0]));
+					if (id) captureSessionFn({ id: id, sessionId: id });
+				} catch (e) { diag(controller, "seed.error", { error: String((e && e.message) || e) }); }
+			}
+			seed();
+			if (sessions && sessions.list && typeof sessions.list.subscribe === "function") {
+				try {
+					var unsub = sessions.list.subscribe(seed);
+					ctx.effect(function () {
+						return function () { try { unsub(); } catch (e) { /* 卸载失败忽略 */ } };
+					}, "ui-taskqueue: 错峰拦截器补挂 (sessions.list 订阅)");
+				} catch (e) { diag(controller, "subscribe.error", { error: String((e && e.message) || e) }); }
+			}
+			// c) 兜底: 订阅也没拿到时, 短时重试 (会话列表/作用域就绪有延迟)
+			//    整段 try/catch: 定时器不可用/异常绝不能让 apply 中断 (否则药丸与设置卡都不注册)
+			try {
+				var tries = 0;
+				var timer = setInterval(function () {
+					tries += 1;
+					if (debugState.installed || tries > 10) { clearInterval(timer); return; }
+					seed();
+				}, 2000);
+				ctx.effect(function () { return function () { clearInterval(timer); }; }, "ui-taskqueue: 错峰拦截器安装重试");
+			} catch (e) { diag(controller, "retry.unavailable", { error: String((e && e.message) || e) }); }
 		}
 
 		// ---------- 设置卡: 错峰出行模式开关 + 状态 ----------
@@ -270,10 +400,12 @@ window.__ModuleLoader__.load({
 				}, function () { busy.current = false; });
 			}
 			var statusState = !loaded ? "loading" : state.status === "error" ? "error" : (state.enabled ? (state.peak ? "peak" : "offpeak") : "off");
+			// v0.8.3 debug: 强制时段时在状态文案后明确标注 (只读显示; 防"忘记关")
+			var forced = state.debug && state.debug !== "auto" ? " [强制 " + state.debug + " · debug]" : "";
 			var statusText = statusState === "loading" ? t("statusLoading")
 				: statusState === "error" ? t("statusError")
-					: statusState === "peak" ? t("statusPeak")
-						: statusState === "offpeak" ? t("statusOffpeak")
+					: statusState === "peak" ? t("statusPeak") + forced
+						: statusState === "offpeak" ? t("statusOffpeak") + forced
 							: "";
 			return React.createElement("div", { className: "dsh-tq-card" }, [
 				React.createElement("div", { className: "dsh-tq-qhead" }, [
@@ -316,8 +448,15 @@ window.__ModuleLoader__.load({
 			var popRef = React.useRef(null);
 			var [open, setOpen] = React.useState(false);
 			var ready = !!(state.loaded && state.status === "ready" && state.enabled);
-			var session = props.session;
-			var sessionId = session && (session.id || session.sessionId);
+			// ⚠️ 0.1.2 修复: 会话作用域槽 (conversation.input.left) 只提供 props.sessionId +
+			// useSession hook —— 旧代码读 props.session 恒 undefined, 导致药丸 return null (消失)
+			// 且拦截器的兜底捕获也一起失效。这里三种来源全兼容 (hook > props.session > props.sessionId)。
+			var sessionFromHook = null;
+			if (typeof props.useSession === "function") {
+				try { sessionFromHook = props.useSession(function (s) { return s; }); } catch (e) { sessionFromHook = null; }
+			}
+			var session = sessionFromHook || props.session || null;
+			var sessionId = props.sessionId || (session && (session.id || session.sessionId)) || null;
 			var exempt = !!(ready && sessionId && state.exempt && state.exempt[sessionId] === true);
 			var peak = state.peak === true;
 			var pillState = !ready ? "offpeak" : (exempt ? "exempt" : (peak ? "peak" : "offpeak"));
@@ -334,6 +473,18 @@ window.__ModuleLoader__.load({
 			function toggleOpen() {
 				setOpen(function (v) { return !v; });
 			}
+			// 0.1.2 适配 (P3/修复): 渲染即把会话实例喂给拦截器 (sessions.binding 取不到时的兜底原型捕获)
+			React.useEffect(function () {
+				if (captureSessionFn && session) { try { captureSessionFn(session); } catch (e) { /* 捕获失败不影响渲染 */ } }
+				if (sessionId && lastPillDiagKey !== sessionId) {
+					lastPillDiagKey = sessionId;
+					diag(props.report, "pill.session", {
+						sessionId: sessionId,
+						from: sessionFromHook ? "useSession" : (props.session ? "props.session" : "props.sessionId"),
+						hasInstance: !!session
+					});
+				}
+			}, [session, sessionId]);
 			// 点外/Esc 关闭 (仅打开期间挂监听; capture 确保弹层内开关先于关闭判定)
 			React.useEffect(function () {
 				if (!open) return;
@@ -445,13 +596,16 @@ window.__ModuleLoader__.load({
 		var inject = ["slots", "locale", "connection", "sessions"];
 
 		function apply(ctx) {
+			// (D, 2026-09-10) 2026-09-09 的临时停用 return 已移除: 服务端已根治重放(E 熔断+终态+claim 驱动),
+			// 客户端恢复"错峰拦截 + 队列面板 + 输入框状态条"。拦截器本身完全防御式(任何异常回退原发送)。
 			injectCss();
 			ctx.effect(function () { return ctx.locale.register(NS, { zh: zh, en: en }); }, "ui-taskqueue: dictionaries");
 			var t = ctx.locale.bind(NS);
 			var controller = createController(ctx.get("connection"));
 
 			// 0) 错峰出行模式拦截 (session.prompt)
-			installPromptInterceptor(ctx, controller);
+			//    整段防御: 拦截器安装异常绝不能让下面的药丸/设置卡注册中断 (否则整个客户端半边失效)
+			try { installPromptInterceptor(ctx, controller); } catch (e) { diag(controller, "install.failed", { error: String((e && e.message) || e) }); }
 
 			// 1) 触发器 (v0.8.2): conversation.input.left —— 渲染在输入框底部工具行
 			//    Full access 选择器右侧 (原 v0.7.0 conversation.input.dock 悬浮状态条已移除)
@@ -464,7 +618,8 @@ window.__ModuleLoader__.load({
 					inject: function () {
 						return {
 							hooks: { taskQueue: controller.store },
-							setExempt: controller.setExempt
+							setExempt: controller.setExempt,
+							report: controller.report
 						};
 					}
 				}, TaskQueuePill);

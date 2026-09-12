@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, rename, stat, chown, chmod, mkdir, appendFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
 import { defineTool } from "@deepseek-ai/dsh-tools";
@@ -83,7 +83,18 @@ const PRICING_PAGE_URL = "https://api-docs.deepseek.com/zh-cn/quick_start/pricin
 const WINDOW_CACHE_TTL_MS = 30 * 60 * 1000;
 const CHECK_INTERVAL_MS = 60000;
 // 派发后超过该时长仍未消费(消息丢失)才重派发, 避免和正常执行竞态
-const REDISPATCH_GRACE_MS = 2 * 60 * 1000;
+const REDISPATCH_GRACE_MS = 2 * 60 * 1000; // ⚠️ 已废弃(E): 旧"丢消息重发"宽限期, 由 claim 观测+熔断取代
+
+// ---------- E 降级 / 熔断 (2026-09-10; 原则: 缺能力静默停用, 禁止重试风暴) ----------
+// 单向状态机: pending(排队) → dispatched(已派发) → done | failed; cancelled 为人工终态。
+// 自动路径**只处理 pending**; dispatched 若无 claim 只会被观测/熔断为 failed, **永不自动重发**。
+// 2026-09-09 事故链: 无终态 + "丢消息重发"校验在 0.1.2 resume 语义下把已执行任务误判为丢失
+//   → 每 ~3 分钟无限重发历史任务。本段即针对该链的 fail-safe 改造。
+const SCHEMA_VERSION = 3;                 // 状态表版本(含终态字段; 落盘后可用于确认新代码已装载)
+const TASK_FAIL_BREAKER = 3;              // 同任务连续 N 次无 claim/派发异常 → failed(停发该任务)
+const TICK_FAIL_BREAKER = 5;              // tick 全局连续异常 ≥N 次 → 自动派发路径整体停用
+const CLAIM_TIMEOUT_MS = 10 * 60 * 1000;  // 派发后多久仍无 claim 且不在 inbox → 记一次"未确认"
+const TERMINAL_STATUS = new Set(["done", "failed", "cancelled"]);
 // 派发消息末尾的固定提示 (v0.3.2): 除用户输入的任务内容外, 追加一段指令,
 // 要求 agent 在第一次回答时根据当前对话内容用 session_rename 工具把本会话
 // 标题重命名为贴切的任务标题 —— 派发窗口在侧边栏的标题贴合实际任务。
@@ -167,43 +178,117 @@ async function readState() {
 	}
 }
 
+let stateFileMeta = null; // 首次写入时记住 STATE_FILE 原属主/权限 (供原子写保留)
 async function writeState(state) {
 	try {
-		await writeFile(STATE_FILE, JSON.stringify(state, null, 2), "utf8");
+		// 原子写 (tmp + rename): 避免写一半崩溃/并发截断产生 0 字节 taskqueue.json
+		// —— readState 遇解析失败会回退到空表, 那等于丢整个队列历史 (2026-09-10 加固)。
+		const tmp = `${STATE_FILE}.tmp`;
+		await writeFile(tmp, JSON.stringify(state, null, 2), "utf8");
+		// 保持原属主/权限: 原子 rename 会以当前进程身份生成新 inode, 否则属主会从
+		// dockeruser(1028) 漂成 root (权限漂移正是 09-09 credentials 事故的同类风险)。
+		try {
+			if (stateFileMeta === null) {
+				stateFileMeta = await stat(STATE_FILE)
+					.then((st) => ({ uid: st.uid, gid: st.gid, mode: st.mode & 0o777 }))
+					.catch(() => false);
+			}
+			if (stateFileMeta) {
+				await chown(tmp, stateFileMeta.uid, stateFileMeta.gid);
+				await chmod(tmp, stateFileMeta.mode);
+			}
+		} catch { /* 非 root/无权限 → 忽略, 不影响写盘 */ }
+		await rename(tmp, STATE_FILE);
 		return true;
 	} catch {
 		return false;
 	}
 }
 
-// ---------- 错峰出行模式状态 (v0.7.0 / v0.8.0) ----------
+// ---------- 错峰出行模式状态 (v0.7.0 / v0.8.0 / v0.8.3) ----------
 // 独立状态文件 (与队列任务状态分离, 设置项不随队列滚动):
-//   { enabled: boolean, exempt: { [sessionId]: true } }
+//   { enabled: boolean, exempt: { [sessionId]: true }, debug: "auto" | "peak" | "offpeak" }
 //   v0.8.0 新增 exempt: 单会话豁免 map —— 豁免会话高峰时段照常发送 (客户端拦截器放行)。
+//   v0.8.3 新增 debug: 强制时段 (调试用) —— "peak" 强制当前为高峰、"offpeak" 强制平峰,
+//     "auto"(默认) = 按官方页判定。强制只影响"时段口径", 不区分客户端拦截与服务端派发:
+//     强制 peak → 消息入队且队列不派发; 强制 offpeak → 消息直发且到期任务立即派发。
 async function readMode() {
 	try {
 		const m = JSON.parse(await readFile(MODE_FILE, "utf8"));
 		return {
 			enabled: m?.enabled === true,
-			exempt: (m?.exempt && typeof m.exempt === "object" && !Array.isArray(m.exempt)) ? m.exempt : {}
+			exempt: (m?.exempt && typeof m.exempt === "object" && !Array.isArray(m.exempt)) ? m.exempt : {},
+			debug: normalizeDebug(m?.debug)
 		};
 	} catch {
-		return { enabled: false, exempt: {} };
+		return { enabled: false, exempt: {}, debug: "auto" };
 	}
 }
 
 async function writeMode(mode) {
 	try {
-		await writeFile(MODE_FILE, JSON.stringify(mode, null, 2), "utf8");
+		// 原子写 (tmp + rename): 与 taskqueue.json 同纪律, 避免写一半留下残缺 JSON
+		const tmp = `${MODE_FILE}.tmp`;
+		await writeFile(tmp, JSON.stringify(mode, null, 2), "utf8");
+		await rename(tmp, MODE_FILE);
 		return true;
 	} catch {
 		return false;
 	}
 }
 
+// ---------- 强制时段 (debug, v0.8.3) ----------
+// 目的: 官方低谷/高峰窗口只在工作日固定时段出现, 平峰(周末/夜间)无法实测错峰功能。
+// 用法: /queue debug peak|offpeak|auto (或 RPC mode.debug)。
+const DEBUG_VALUES = ["auto", "peak", "offpeak"];
+function normalizeDebug(v) {
+	return DEBUG_VALUES.includes(v) ? v : "auto";
+}
+/** 当前是否高峰: 强制值优先于官方页判定 (唯一口径, 客户端与服务端共用同一返回值) */
+function effectivePeak(mode, windows, now = new Date()) {
+	if (mode?.debug === "peak") return true;
+	if (mode?.debug === "offpeak") return false;
+	return isBeijingPeak(windows, now);
+}
+/** 时段来源文案: 强制时明确标注 debug, 便于"忘记关"时一眼可见 */
+function peakSourceText(mode, windowSource) {
+	if (mode?.debug === "peak") return `强制高峰(debug)`;
+	if (mode?.debug === "offpeak") return `强制平峰(debug)`;
+	return windowSource;
+}
+/** mode.get / mode.set / mode.exempt / mode.debug 的统一返回体 */
+function modeValue(mode, windows, windowSource) {
+	return {
+		enabled: mode.enabled,
+		peak: effectivePeak(mode, windows),
+		windowSource,
+		peakSource: peakSourceText(mode, windowSource),
+		debug: mode.debug,
+		exempt: mode.exempt
+	};
+}
+
+// ---------- 客户端诊断上报 (v0.8.3) ----------
+// 背景: 错峰拦截器跑在浏览器里, 之前"拦截器没装上"完全静默 —— 只能靠用户现象猜。
+// 客户端 apply/药丸渲染/拦截命中都上报一行, 服务端落盘 + 保留最近若干条供 mode.get 回读,
+// 这样没有浏览器控制台也能远程取证 (log/taskqueue/offpeak-debug.log)。
+const DIAG_LOG = "/workspace/log/taskqueue/offpeak-debug.log";
+const diagRecent = [];
+async function appendDiag(entry) {
+	const line = JSON.stringify({ at: new Date().toISOString(), ...entry });
+	diagRecent.push({ at: entry.at ?? new Date().toISOString(), ...entry });
+	if (diagRecent.length > 20) diagRecent.splice(0, diagRecent.length - 20);
+	try {
+		await mkdir("/workspace/log/taskqueue", { recursive: true });
+		await appendFile(DIAG_LOG, line + "\n", "utf8");
+	} catch { /* 落盘失败不影响功能 (仅诊断) */ }
+}
+
 const STATUS_TEXT = {
 	pending: "排队中",
 	dispatched: "已派发",
+	done: "已完成",
+	failed: "已失败",
 	cancelled: "已取消"
 };
 
@@ -393,7 +478,10 @@ export async function apply(ctx, config) {
 			}
 		} else {
 			// 默认模式: blank 会话 → 极简确认 turn 转正
-			const blank = session && !session.events.some((e) => e.type === "turn/start");
+			// 2026-09-10 (0.1.2 适配): session.events 已不可用 → 无法判定 blank 时按"非 blank"处理
+			// (fail-safe: 宁可不发转正确认 turn, 也不因读不到而误发/抛错; 旧写法直接抛
+			//  "Cannot read properties of undefined (reading 'some')" 会让 /queue add 整条失败)
+			const blank = Array.isArray(session?.events) && !session.events.some((e) => e.type === "turn/start");
 			if (blank && agent) {
 				try {
 					const confirm = createUserMessage({
@@ -512,7 +600,192 @@ export async function apply(ctx, config) {
 		});
 	}
 
-	async function dispatchTask(state, task, agent) {
+	// ================= E: 降级 / 熔断 / 终态 (2026-09-10) =================
+	// 原则(写进代码与文档): 缺能力 → 静默停用该入口(fail-safe off); 禁止重试风暴;
+	//   禁止把失败当成功; 禁止历史任务自动重放; 自动路径只处理 fresh pending。
+	let autoDisabled = false;            // 本进程内自动派发是否停用 (重启自动重测能力, 不持久化)
+	let autoDisabledReason = null;
+	let tickFailStreak = 0;              // tick 全局连续异常计数 (某轮零异常即清零)
+	const dispatchedMsgIds = new Map();  // messageId -> taskId (claim 事件快速过滤, 避免无关消息写盘)
+	const claimedMsgIds = new Set();     // 已被 claim 成会话内 user/message 的 messageId (0.1.2 事件观察者维护)
+	const titledSessions = new Set();    // 本插件已设过标题的会话 (替代不可用的 session.events 判定)
+
+	/** 能力门闩: boot 时静态探测宿主能力, 缺失即停用自动路径 (宁停勿发) */
+	function probeCapabilities() {
+		const missing = [];
+		const A = ctx.agents;
+		if (!A) missing.push("agents 服务");
+		else {
+			if (typeof A.get !== "function") missing.push("agents.get");
+			if (typeof A.list !== "function") missing.push("agents.list");
+			if (typeof A.resume !== "function") missing.push("agents.resume");
+		}
+		if (typeof ctx.on !== "function") missing.push("ctx.on(事件订阅)");
+		if (typeof ctx.effect !== "function") missing.push("ctx.effect");
+		return missing.length ? { ok: false, reason: `缺少能力: ${missing.join(", ")}` } : { ok: true };
+	}
+
+	/** 停用自动派发 (只记日志, 不重试; 人工 run-now --force 不受影响) */
+	function disableAuto(reason) {
+		if (autoDisabled) return;
+		autoDisabled = true;
+		autoDisabledReason = reason;
+		ctx.logger?.warn?.(`dsh-taskqueue: [fail-safe] 自动派发已整体停用 — ${reason} (历史任务不再自动处理; 需执行请人工 /queue run-now <id> --force)`);
+	}
+
+	const _caps = probeCapabilities();
+	if (!_caps.ok) disableAuto(_caps.reason);
+
+	/** 终态置位 (单向: 已到终态不再改; 顺手清掉 claim 索引) */
+	function setTerminal(task, status, extra = {}) {
+		if (TERMINAL_STATUS.has(task.status)) return false;
+		task.status = status;
+		task[status === "done" ? "doneAt" : status === "failed" ? "failedAt" : "cancelledAt"] = new Date().toISOString();
+		Object.assign(task, extra);
+		if (task.messageId) dispatchedMsgIds.delete(task.messageId);
+		return true;
+	}
+
+	/** 熔断/失败告警: 日志 warn + (会话在线时)队列横幅; 绝不重发 */
+	function alertTask(task, text) {
+		ctx.logger?.warn?.(`dsh-taskqueue: ${text}`);
+		try {
+			const agent = task.sessionId ? ctx.agents.get?.(task.sessionId) : null;
+			if (agent?.session) {
+				appendQueueBanner(agent.session, {
+					state: "warn",
+					title: `任务 #${task.id} 已熔断`,
+					lines: [text, `内容: ${oneLine(task.content).slice(0, 120)}`]
+				});
+			}
+		} catch { /* 告警失败不影响主流程 */ }
+	}
+
+	/** 是否已被 claim 成会话内 user/message (完成证据; 只看同一进程内的会话视图, 不 resume) */
+	function isMessageClaimed(task, agent) {
+		if (!task.messageId) return false;
+		if (claimedMsgIds.has(task.messageId)) return true; // 0.1.2: 观察者维护的权威来源
+		try {
+			const evs = agent?.session?.events ?? [];
+			for (let i = evs.length - 1; i >= 0; i--) {
+				const e = evs[i];
+				if (e.type === "user/message" && e.data?.id === task.messageId) return true;
+			}
+		} catch { /* 会话不可读 → 无证据(也不重发) */ }
+		return false;
+	}
+
+	/** 消息是否仍挂在 inbox (在飞, 非失败) */
+	function isMessageInInbox(task, agent) {
+		if (!task.messageId) return false;
+		try {
+			if (agent?.inbox?.nextTurn?.some((m) => m.id === task.messageId)) return true;
+			if (agent?.inbox?.nextStep?.some((m) => m.id === task.messageId)) return true;
+		} catch { /* 保守: 读不到按不在 inbox 处理 */ }
+		return false;
+	}
+
+	/** 人工 force 重新排队 (E6: 历史任务只允许人工 run-now; 这是唯一允许回到 pending 的路径) */
+	function requeueForManualForce(task) {
+		task.lastTerminal = { status: task.status, at: task[task.status + "At"] ?? null };
+		task.status = "pending";
+		task.requeuedAt = new Date().toISOString();
+		task.requeuedBy = "manual-force";
+		delete task.dispatchedAt;
+		delete task.messageId;
+		task.roundId = null;
+		task.dispatchCount = 0;
+		task.unconfirmedCount = 0;
+		task.failCount = 0;
+		delete task.failReason;
+	}
+
+	/** claim = 消息被 agent 真正取走执行 → done (E3 完成依据; 只置终态, 从不重发) */
+	async function onClaimed(payload) {
+		try {
+			const msgId = payload?.message?.id;
+			if (!msgId || !dispatchedMsgIds.has(msgId)) return; // 快速过滤: 与队列无关的消息零写盘
+			await mutateState((state) => {
+				let hit = 0;
+				for (const t of state.tasks) {
+					if (t.status !== "dispatched" || t.messageId !== msgId) continue;
+					if (setTerminal(t, "done", { doneTurn: payload?.turn ?? null, failCount: 0, unconfirmedCount: 0 })) hit++;
+				}
+				if (hit) ctx.logger?.info?.(`dsh-taskqueue: claim 确认 ${hit} 个任务 → done (messageId=${String(msgId).slice(0, 8)}${payload?.turn != null ? `, turn=${payload.turn}` : ""})`);
+				return hit;
+			});
+		} catch (err) {
+			ctx.logger?.warn?.(`dsh-taskqueue: claim 处理失败(忽略, 不重发): ${String(err?.message ?? err)}`);
+		}
+	}
+
+	/** discarded = 派发消息被 inbox 丢弃, 从未执行 → failed (绝不重发) */
+	async function onDiscarded(payload) {
+		try {
+			const msgId = payload?.message?.id;
+			if (!msgId || !dispatchedMsgIds.has(msgId)) return;
+			const failed = [];
+			await mutateState((state) => {
+				for (const t of state.tasks) {
+					if (t.status !== "dispatched" || t.messageId !== msgId) continue;
+					if (setTerminal(t, "failed", { failReason: "派发消息被 inbox 丢弃, 从未执行" })) failed.push(t);
+				}
+				return failed.length;
+			});
+			for (const t of failed) alertTask(t, `任务 #${t.id} 派发消息被 inbox 丢弃(从未执行) → failed (不重发)`);
+		} catch (err) {
+			ctx.logger?.warn?.(`dsh-taskqueue: discarded 处理失败(忽略, 不重发): ${String(err?.message ?? err)}`);
+		}
+	}
+
+	// 订阅 claim/discarded (全局钩子: cordis dispatch 对 global 不做作用域过滤, 与 reconcile 同法)
+	// 2026-09-10 (0.1.2 适配): agent.session.events 不再可用 → 用 session/event 观察者
+	// 自行跟踪"派发消息已被 claim 成会话内 user/message"(只记我们关心的 messageId, 内存有界)
+	ctx.on("session/event", (_session, event) => {
+		try {
+			const id = event?.data?.id;
+			if (event?.type === "user/message" && id && dispatchedMsgIds.has(id)) claimedMsgIds.add(id);
+		} catch { /* 忽略 */ }
+	}, { global: true });
+	ctx.on("agent/inbox/claimed", (payload) => { void onClaimed(payload); }, { global: true });
+	ctx.on("agent/inbox/discarded", (payload) => { void onDiscarded(payload); }, { global: true });
+
+	// boot 引导: 建 claim 索引 + 状态表版本标记 (只读+一次版本落盘; 不触发任何派发)
+	void serialized(async () => {
+		try {
+			const st = await readState();
+			for (const t of st.tasks ?? []) if (t.status === "dispatched" && t.messageId) dispatchedMsgIds.set(t.messageId, t.id);
+			if (st.schemaVersion !== SCHEMA_VERSION) {
+				st.schemaVersion = SCHEMA_VERSION;
+				await writeState(st);
+			}
+			ctx.logger?.info?.(`dsh-taskqueue: 状态表 v${st.schemaVersion ?? 2} → v${SCHEMA_VERSION} 就绪; 待确认派发消息 ${dispatchedMsgIds.size} 个; 自动派发=${autoDisabled ? `停用(${autoDisabledReason})` : "启用"}`);
+		} catch (err) {
+			ctx.logger?.warn?.(`dsh-taskqueue: 启动引导失败(自动路径保守停用): ${String(err?.message ?? err)}`);
+			disableAuto("启动引导异常");
+		}
+	});
+
+	async function dispatchTask(state, task, agent, opts = {}) {
+		const force = opts.force === true;
+		// E 硬门闩: 自动路径只允许 pending; 历史/终态任务必须人工 force 显式重排 (防任何未来 bug 造成重放)
+		if (task.status !== "pending" && !force) {
+			ctx.logger?.warn?.(`dsh-taskqueue: 拒绝隐式重发任务 #${task.id} (status=${task.status}); 历史任务只能人工 /queue run-now ${task.id} --force`);
+			return false;
+		}
+		if (autoDisabled && !force) {
+			ctx.logger?.warn?.(`dsh-taskqueue: 自动派发停用中(${autoDisabledReason}), 跳过任务 #${task.id}`);
+			return false;
+		}
+		// 去重键 (E4): (sessionId + taskId + roundId) 幂等; 本轮已有 claim 证据 → 直接终态, 不重复发送
+		const roundId = force ? randomUUID() : (task.roundId ?? randomUUID());
+		task.roundId = roundId;
+		task.dedupeKey = `${task.sessionId ?? "-"}|${task.id}|${roundId}`;
+		if (task.messageId && isMessageClaimed(task, agent)) {
+			setTerminal(task, "done", { failCount: 0 });
+			ctx.logger?.info?.(`dsh-taskqueue: 任务 #${task.id} 本轮(${roundId.slice(0, 8)})已有 claim 证据 → 判 done, 不重复发送`);
+			return true;
+		}
 		const message = createUserMessage({
 			// 消息前加"自动调度任务 #N"提示, 方便在对话里一眼识别出是队列自动派发的
 			// (而非自己手动输入的消息), 并知道是第几号任务;
@@ -523,15 +796,41 @@ export async function apply(ctx, config) {
 			// 派发后在对话中形成可见的记录, 而不是折叠的"上下文注入"灰条。
 			source: { kind: "user" }
 		});
-		task.messageId = message.id; // 记录消息 id, 用于重启后校验消息是否仍存活
-		agent.followup(message);
+		task.messageId = message.id; // 记录消息 id (claim 匹配/去重键的核心)
+		task.dispatchCount = (task.dispatchCount || 0) + 1;
+		task.dispatchedBy = force ? "manual-force" : "auto";
 		task.status = "dispatched";
 		task.dispatchedAt = new Date().toISOString();
+		// ⚠️ 不要在此重置 failCount: 它是"连续失败"熔断计数, 只有 claim/done 才清零;
+		//    否则投递失败会被每轮重置, 熔断永远不触发 (2026-09-10 harness 实测踩到)。
+		task.unconfirmedCount = 0;
+		// ⚠️ 顺序关键 (2026-09-10 E2E 实测教训): 必须在 followup 之前完成
+		//   ① 置 dispatched ② 登记 claim 索引 ③ 落盘 —— claim 事件可能紧随 followup
+		//   触发; 若登记/落盘在后, 处理函数会因"索引未命中"或"状态文件里还是 pending"
+		//   而漏掉本次 claim, 任务将永远停在 dispatched (无终态)。
+		dispatchedMsgIds.set(task.messageId, task.id);
+		await writeState(state);
+		// ④ 最后才真正投递 (此处可能同步/紧随触发 claim 事件 → 上面三步保证能被匹配到)
+		try {
+			agent.followup(message);
+		} catch (err) {
+			// 投递失败 = 消息未送达: 回滚为 pending(清掉 messageId/索引, 避免留下"假 dispatched"),
+			// 再由 tick 的熔断计数决定是否重试/停发 (最多 TASK_FAIL_BREAKER 次, 不是重试风暴)。
+			dispatchedMsgIds.delete(task.messageId);
+			delete task.messageId;
+			delete task.dispatchedAt;
+			task.status = "pending";
+			await writeState(state);
+			throw err;
+		}
 		// 自动标题 (v0.3.0): 若目标会话尚无标题, 按任务内容设置确定性标题 —
 		// 让派发窗口在侧边栏立即可辨识 (source.kind="user" 固定标题, 不触发 LLM 生成)。
 		try {
 			const session = agent.session;
-			const hasTitle = session?.events?.some((e) => e.type === "session/title");
+			// 2026-09-10: session.events 不可用 → 改为内存跟踪"本会话是否已由本插件设过标题"
+			const hasTitle = Array.isArray(session?.events)
+				? session.events.some((e) => e.type === "session/title")
+				: titledSessions.has(String(session?.id ?? ""));
 			if (session && !hasTitle) {
 				const title = `任务 #${task.id} · ${oneLine(task.content).slice(0, 20)}`;
 				session.append("session/title", {
@@ -539,13 +838,27 @@ export async function apply(ctx, config) {
 					messageSeqs: [],
 					source: { kind: "user" }
 				});
+				titledSessions.add(String(session.id ?? ""));
 			}
 		} catch (err) {
 			ctx.logger?.warn?.(`dsh-taskqueue: 设置任务 #${task.id} 会话标题失败: ${String(err?.message ?? err)}`);
 		}
+		// followup 期间 claim 处理函数可能已把本任务置终态并落盘 → 合并回来再写,
+		// 否则会用陈旧的内存状态覆盖掉刚写入的 done (stale write)。
+		try {
+			const fresh = await readState();
+			const ft = fresh?.tasks?.find((x) => x.id === task.id);
+			if (ft && TERMINAL_STATUS.has(ft.status) && !TERMINAL_STATUS.has(task.status)) {
+				task.status = ft.status;
+				task.doneAt = ft.doneAt ?? task.doneAt;
+				task.doneTurn = ft.doneTurn ?? task.doneTurn;
+				task.failReason = ft.failReason ?? task.failReason;
+			}
+		} catch { /* 读回失败则按内存状态落盘 */ }
 		const ok = await writeState(state);
 		if (!ok) ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${task.id} 已派发但状态落盘失败, 重启后可能重复派发`);
-		ctx.logger?.info?.(`dsh-taskqueue: 已派发任务 #${task.id} 到 agent ${agent.id}`);
+		ctx.logger?.info?.(`dsh-taskqueue: 已派发任务 #${task.id} 到 agent ${agent.id} (round=${roundId.slice(0, 8)}, by=${task.dispatchedBy})`);
+		return true;
 	}
 
 	/**
@@ -622,6 +935,8 @@ export async function apply(ctx, config) {
 		await serialized(async () => {
 			const state = await readState();
 			const windowsNow = await resolveWindows();
+			const modeNow = await readMode(); // v0.8.3: 强制时段(debug) 与客户端拦截同口径
+			const peakNow = effectivePeak(modeNow, windowsNow);
 			const now = Date.now();
 			// v0.6.0: 容器重启检测 —— PID1 starttime 变化 = 发生一次重启。
 			// trigger=restart 的任务只在"检测到重启的这一次 tick"派发 (尝试一次;
@@ -630,17 +945,46 @@ export async function apply(ctx, config) {
 			const bootId = readBootId();
 			const restartDetected = bootId !== null && state.lastBootId !== bootId;
 			if (bootId === null) ctx.logger?.warn?.("dsh-taskqueue: 无法读取容器启动标识 (/proc/1/stat), 跳过重启触发检测");
-			// 1) 派发到期任务 (pending); v0.4.3: 编辑锁中的任务 (及同会话后续任务) 跳过
+			// 1) 派发到期任务 (**仅 pending**); v0.4.3: 编辑锁中的任务 (及同会话后续任务) 跳过
 			cleanupStaleLocks(state);
-			const due = state.tasks.filter((t) => t.status === "pending"
+			let changed = false;
+			const pendingAlerts = [];
+			let tickHadError = false;
+			// E 可观测性: 自动路径的熔断/恢复状态落盘 (dsh web 不转出插件 logger, 日志不可取证)
+			if (autoDisabled && state.failSafe?.disabled !== true) {
+				state.failSafe = { disabled: true, reason: autoDisabledReason, at: new Date().toISOString() };
+				changed = true;
+			} else if (!autoDisabled && state.failSafe?.disabled === true) {
+				state.failSafe = { disabled: false, at: new Date().toISOString(), note: "能力探测通过, 自动路径恢复" };
+				changed = true;
+			}
+			if (autoDisabled) {
+				ctx.logger?.warn?.(`dsh-taskqueue: [fail-safe] 自动派发停用中 (${autoDisabledReason}); 本轮只观测不派发, 待人工 run-now`);
+			}
+			const due = autoDisabled ? [] : state.tasks.filter((t) => t.status === "pending"
 				&& (t.trigger === "restart"
 					? restartDetected
-					: (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !isBeijingPeak(windowsNow)))
+					: (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !peakNow))
 				&& !isTaskLocked(state, t));
 			for (const task of due) {
-				const agent = await findTargetAgent(state, task);
-				if (!agent) continue; // 该任务无可用会话, 下次再试
-				await dispatchTask(state, task, agent);
+				try {
+					const agent = await findTargetAgent(state, task);
+					if (!agent) continue; // 该任务无可用会话, 下次再试
+					const sent = await dispatchTask(state, task, agent);
+					if (sent) changed = true;
+				} catch (err) {
+					// E 熔断: 派发异常 → 任务失败计数 + 全局连续异常计数(按异常次数累加); 达限即停发
+					tickHadError = true;
+					tickFailStreak += 1;
+					task.failCount = (task.failCount || 0) + 1;
+					task.lastFailReason = String(err?.message ?? err);
+					ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${task.id} 派发异常 (任务失败计数 ${task.failCount}/${TASK_FAIL_BREAKER}, 全局连续异常 ${tickFailStreak}/${TICK_FAIL_BREAKER}): ${task.lastFailReason}`);
+					changed = true;
+					if (tickFailStreak >= TICK_FAIL_BREAKER) disableAuto(`tick 连续 ${tickFailStreak} 次派发异常`);
+					if (task.failCount >= TASK_FAIL_BREAKER) {
+						if (setTerminal(task, "failed", { failReason: `连续 ${task.failCount} 次派发异常: ${task.lastFailReason}` })) pendingAlerts.push(task);
+					}
+				}
 			}
 			// 消费重启事件: 无论 restart 任务是否全部派发成功, 都更新 lastBootId,
 			// 防止后续 tick 重复触发 (派发失败的任务保持 pending, 等下次重启再试)
@@ -649,17 +993,40 @@ export async function apply(ctx, config) {
 				await writeState(state);
 				ctx.logger?.info?.(`dsh-taskqueue: 检测到容器重启 (bootId=${bootId}), restart 触发任务 ${due.filter((t) => t.trigger === "restart").length} 个到期(失败保持排队等下次重启)`);
 			}
-			// 2) 校验已派发任务: 派发超过 REDISPATCH_GRACE_MS 且消息已丢失(典型:
-			//    派发后未消费就遇容器重启, dispose 清空 inbox) -> 重新派发
+			// 2) E: 已派发任务的**完成观测 (claim 驱动)** —— 本段只观测/置终态, **绝不重发**。
+			//    历史 dispatched: 目标会话已含同 messageId 的 user/message → done;
+			//    仍挂在 inbox → 在飞(不计数); 既不在 inbox 又无 claim 且超过 CLAIM_TIMEOUT_MS
+			//    → 记一次"未确认", 连续 TASK_FAIL_BREAKER 次 → failed + 告警。
+			//    ⚠️ 本段**不使用 agents.resume**: 只读在线 agent 视图, 避免重现 0.1.2
+			//    resume 语义误判("已执行任务被判丢失") → 无限重发的原始事故链。
 			for (const task of state.tasks) {
+				// (D, 2026-09-10) 2026-09-09 的 kill switch `if (true) continue;` 已删除:
+				// E 的 claim 驱动完成 + 熔断已接管, 且本块**不含任何重发调用**(只观测/置终态)。
 				if (task.status !== "dispatched" || !task.dispatchedAt) continue;
-				if (now - Date.parse(task.dispatchedAt) < REDISPATCH_GRACE_MS) continue;
-				const agent = await findTargetAgent(state, task);
-				if (!agent) continue;
-				if (isMessageAlive(task, agent)) continue;
-				ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${task.id} 派发消息已丢失(可能重启清空 inbox), 重新派发`);
-				await dispatchTask(state, task, agent);
+				const sid = task.sessionId ?? state.targetSessionId;
+				const agent = sid ? ctx.agents.get?.(sid) : null;
+				if (!agent) continue; // 会话不在线: 无证据, 状态不动 (等人工或下次在线)
+				if (isMessageClaimed(task, agent)) {
+					if (setTerminal(task, "done", { failCount: 0, unconfirmedCount: 0 })) {
+						changed = true;
+						ctx.logger?.info?.(`dsh-taskqueue: 任务 #${task.id} 观测到 claim 证据 → done`);
+					}
+					continue;
+				}
+				if (isMessageInInbox(task, agent)) { task.unconfirmedCount = 0; continue; }
+				if (now - Date.parse(task.dispatchedAt) < CLAIM_TIMEOUT_MS) continue;
+				task.unconfirmedCount = (task.unconfirmedCount || 0) + 1;
+				task.lastUnconfirmedAt = new Date().toISOString();
+				changed = true;
+				ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${task.id} 派发后无 claim 且不在 inbox (未确认 ${task.unconfirmedCount}/${TASK_FAIL_BREAKER})`);
+				if (task.unconfirmedCount >= TASK_FAIL_BREAKER) {
+					if (setTerminal(task, "failed", { failReason: `派发后连续 ${task.unconfirmedCount} 轮无 claim 且不在 inbox (未执行/凭据失败等)` })) pendingAlerts.push(task);
+				}
 			}
+			// E 熔断: 某轮零异常 → 全局连续异常计数清零 (累计在 catch 内按异常次数进行)
+			if (!tickHadError) tickFailStreak = 0;
+			for (const t of pendingAlerts) alertTask(t, `任务 #${t.id} 已熔断为 failed: ${t.failReason ?? "未知原因"} (不重发; 需重跑请人工 /queue run-now ${t.id} --force)`);
+			if (changed) await writeState(state);
 		});
 	}
 
@@ -716,7 +1083,8 @@ export async function apply(ctx, config) {
 				const rest2 = state.tasks.filter((t) => t.status !== "pending" && !isQueuedSending(t));
 				const queueN = pending.length + queued.length;
 				const windowsNow = await resolveWindows();
-				const peak = isBeijingPeak(windowsNow);
+				const modeNow = await readMode();
+				const peak = effectivePeak(modeNow, windowsNow);
 				// v0.4.3: 横幅文字精简 (历史移到面板底部), openPanel=true 出现即展开手风琴
 				appendQueueBanner(invocation?.agent?.session, {
 					openPanel: true,
@@ -725,6 +1093,7 @@ export async function apply(ctx, config) {
 						queueN === 0
 							? "(队列为空)"
 							: `排队中 ${queueN} 个 / 历史 ${rest2.length} 个`,
+						`时段: ${peak ? "高峰" : "平峰"} · ${peakSourceText(modeNow, windowSource)}`,
 						"任务列表见下方面板: 点行展开可 编辑/取消/立即派发 (已派发未执行的也可取消)"
 					]
 				});
@@ -761,15 +1130,18 @@ export async function apply(ctx, config) {
 				});
 			}
 			case "run-now": {
-				const id = parseInt(rest, 10);
-				if (!Number.isInteger(id)) return { kind: "error", text: "用法: /queue run-now <id>" };
+				// E6: 历史/终态任务只允许人工强制重排 (--force); 自动路径永远不会重放历史
+				const force = /(^|\s)--force(\s|$)/.test(rest);
+				const id = parseInt(rest.replace(/--force/g, "").trim(), 10);
+				if (!Number.isInteger(id)) return { kind: "error", text: "用法: /queue run-now <id> [--force]  (--force = 人工重新派发历史/终态任务)" };
 				return await mutateState(async (state) => {
-					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
-					if (!t) return { kind: "error", text: `未找到排队中的任务 #${id}` };
+					const t = state.tasks.find((x) => x.id === id && (x.status === "pending" || force));
+					if (!t) return { kind: "error", text: `未找到排队中的任务 #${id} (历史/终态任务需 --force)` };
+					if (t.status !== "pending") requeueForManualForce(t);
 					if (isTaskLocked(state, t)) return { kind: "error", text: `任务 #${id} 正在编辑中, 暂不能派发 (保存或取消编辑后再试)` };
 					const agent = await findTargetAgent(state, t);
 					if (!agent) return { kind: "error", text: "任务绑定会话已离线且无兜底会话, 稍后再试" };
-					await dispatchTask(state, t, agent);
+					await dispatchTask(state, t, agent, { force: true });
 					// v0.4.2: 派发反馈注入横幅卡片 (完整内容)
 					appendQueueBanner(invocation?.agent?.session, {
 						title: `任务 #${id} 已派发`,
@@ -788,6 +1160,29 @@ export async function apply(ctx, config) {
 					return { kind: "success", text: `兜底派发目标会话已设为 ${rest}` };
 				});
 			}
+			// v0.8.3 debug: 强制当前时段 (平峰期实测错峰功能; 客户端拦截与服务端派发同口径)
+			case "debug": case "forcepeak": {
+				const arg = rest.trim().toLowerCase();
+				const cur = await readMode();
+				if (!arg) {
+					return { kind: "success", text: `当前强制时段: ${cur.debug}${cur.debug === "auto" ? " (按官方页判定)" : ""}\n用法: /queue debug peak | offpeak | auto` };
+				}
+				if (!DEBUG_VALUES.includes(arg)) {
+					return { kind: "error", text: `用法: /queue debug peak | offpeak | auto (当前: ${cur.debug})` };
+				}
+				await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug: arg });
+				await appendDiag({ event: "mode.debug", debug: arg, via: "slash" });
+				const windowsNow = await resolveWindows();
+				const peak = effectivePeak({ ...cur, debug: arg }, windowsNow);
+				const label = arg === "peak" ? "强制高峰" : arg === "offpeak" ? "强制平峰" : "自动(官方页判定)";
+				return { kind: "success", text: [
+					`已设置: ${label} (debug=${arg})`,
+					arg === "peak" ? "→ 客户端: 高峰时段消息自动入队; 服务端: 队列暂停派发" :
+						arg === "offpeak" ? "→ 客户端: 消息正常直发; 服务端: 到期任务立即派发" :
+							`→ 恢复官方页判定: 当前${peak ? "高峰" : "平峰"} (${windowSource})`,
+					"恢复: /queue debug auto"
+				].join("\n") };
+			}
 			case "help": case "":
 				return { kind: "success", text: [
 					"/queue add <内容>                   入队(绑当前会话), 等低谷自动执行",
@@ -799,6 +1194,7 @@ export async function apply(ctx, config) {
 					"/queue edit <id> <新内容>           修改任务内容",
 					"/queue run-now <id>                 立即派发(不等低谷)",
 					"/queue target [会话id]              查看/设置兜底派发目标会话",
+					"/queue debug peak|offpeak|auto      强制当前时段 (调试: 平峰期实测错峰功能)",
 					"/queue help                         本帮助",
 					"低谷时段由官方页动态解析(当前: 周一至周五 9-12/14-18 高峰, 其余低谷)"
 				].join("\n") };
@@ -859,7 +1255,8 @@ export async function apply(ctx, config) {
 		execute: async (_args, exec) => {
 			const state = await readState();
 			const windowsNow = await resolveWindows();
-			const peak = isBeijingPeak(windowsNow);
+			const modeNow = await readMode();
+			const peak = effectivePeak(modeNow, windowsNow);
 			const pending = state.tasks.filter((t) => t.status === "pending");
 			const queued = state.tasks.filter((t) => isQueuedSending(t)); // v0.5.0
 			const done = state.tasks.filter((t) => t.status !== "pending" && !isQueuedSending(t));
@@ -872,10 +1269,11 @@ export async function apply(ctx, config) {
 					queueN === 0
 						? "(队列为空)"
 						: `排队中 ${queueN} 个 / 历史 ${done.length} 个`,
+					`时段: ${peak ? "高峰" : "平峰"} · ${peakSourceText(modeNow, windowSource)}`,
 					"任务列表见下方面板: 点行展开可 编辑/取消/立即派发 (已派发未执行的也可取消)"
 				]
 			});
-			return { text: `任务队列: ${queueN} 排队中 / ${done.length} 历史 (详情见横幅面板)` };
+			return { text: `任务队列: ${queueN} 排队中 / ${done.length} 历史 (时段: ${peak ? "高峰" : "平峰"} · ${peakSourceText(modeNow, windowSource)}, 详情见横幅面板)` };
 		},
 		presentCall: () => ({ card: "generic", title: "查看任务队列", kind: "other" })
 	}));
@@ -933,20 +1331,25 @@ export async function apply(ctx, config) {
 
 	ctx.tools.register(defineTool({
 		name: "queue_runnow",
-		description: "立即派发排队中的任务(不等低谷时段, 按 id, 派发回任务绑定会话)",
-		parameters: { id: { type: "integer", required: true, description: "任务 id" } },
+		description: "立即派发排队中的任务(不等低谷时段, 按 id; force=true 才可人工重排历史/终态任务)",
+		parameters: {
+			id: { type: "integer", required: true, description: "任务 id" },
+			force: { type: "boolean", description: "人工强制重新派发历史/终态任务 (E6: 自动路径永不重放历史; 缺省 false)" }
+		},
 		output: {
 			schema: { type: "object", additionalProperties: false, properties: { text: { type: "string", required: true } } },
 			render: (_args, value) => [{ type: "text", text: value.text }]
 		},
 		execute: async (args, exec) => {
+			const force = args.force === true;
 			return await mutateState(async (state) => {
-				const t = state.tasks.find((x) => x.id === args.id && x.status === "pending");
-				if (!t) throw new Error(`未找到排队中的任务 #${args.id}`);
+				const t = state.tasks.find((x) => x.id === args.id && (x.status === "pending" || force));
+				if (!t) throw new Error(`未找到排队中的任务 #${args.id} (历史/终态任务需 force=true)`);
+				if (t.status !== "pending") requeueForManualForce(t);
 				if (isTaskLocked(state, t)) throw new Error(`任务 #${args.id} 正在编辑中, 暂不能派发 (保存或取消编辑后再试)`);
 				const agent = await findTargetAgent(state, t);
 				if (!agent) return { text: `任务 #${t.id} 绑定会话已离线且无兜底会话, 保持排队` };
-				await dispatchTask(state, t, agent);
+				await dispatchTask(state, t, agent, { force: true });
 				// v0.4.2: 派发反馈注入横幅卡片 (完整内容)
 				appendQueueBanner(exec?.agent?.session, {
 					title: `任务 #${t.id} 已派发`,
@@ -980,7 +1383,8 @@ export async function apply(ctx, config) {
 			case "list": {
 				const state = await readState();
 				const windowsNow = await resolveWindows();
-				const peak = isBeijingPeak(windowsNow);
+				const modeNow = await readMode();
+				const peak = effectivePeak(modeNow, windowsNow);
 				cleanupStaleLocks(state);
 				const tasks = state.tasks.map((t) => ({
 					id: t.id,
@@ -1005,7 +1409,9 @@ export async function apply(ctx, config) {
 					targetSessionId: state.targetSessionId,
 					targetSessionShort: shortSession(state.targetSessionId),
 					peak,
-					windowSource
+					windowSource,
+					peakSource: peakSourceText(modeNow, windowSource),
+					debug: modeNow.debug
 				} };
 			}
 			case "edit": {
@@ -1033,17 +1439,20 @@ export async function apply(ctx, config) {
 				});
 			}
 			case "runnow": {
+				// E6: payload.force=true 才允许人工重排历史/终态任务 (面板按钮不带 force, 行为不变)
 				const id = payload?.id;
+				const force = payload?.force === true;
 				if (!Number.isInteger(id)) return { ok: false, error: { code: "bad-request", message: "需要 id(整数)" } };
 				return await mutateState(async (state) => {
-					const t = state.tasks.find((x) => x.id === id && x.status === "pending");
+					const t = state.tasks.find((x) => x.id === id && (x.status === "pending" || force));
 					if (!t) return { ok: false, error: { code: "not-found", message: `未找到排队中的任务 #${id}` } };
+					if (t.status !== "pending") requeueForManualForce(t);
 					if (isTaskLocked(state, t)) {
 						return { ok: false, error: { code: "locked", message: `任务 #${id} 正在编辑中, 暂不能派发 (保存或取消编辑后再试)` } };
 					}
 					const agent = await findTargetAgent(state, t);
 					if (!agent) return { ok: false, error: { code: "unavailable", message: "任务绑定会话已离线且无兜底会话, 稍后再试" } };
-					await dispatchTask(state, t, agent);
+					await dispatchTask(state, t, agent, { force: true });
 					return { ok: true, value: { id, text: `任务 #${id} 已立即派发到 ${shortSession(agent.id)}` } };
 				});
 			}
@@ -1067,32 +1476,25 @@ export async function apply(ctx, config) {
 				});
 			}
 			// ── v0.7.0 错峰出行模式 ────────────────────────────────────────────
-			// mode.get    → { enabled, peak, windowSource, exempt }  当前开关 + 实时高峰状态 + 豁免 map
-			// mode.set    { enabled }                               持久化开关 (写 MODE_FILE, 保留 exempt)
+			// mode.get    → { enabled, peak, windowSource, peakSource, debug, exempt } 开关 + 实时时段 + 豁免 map
+			// mode.set    { enabled }                               持久化开关 (写 MODE_FILE, 保留 exempt/debug)
 			// mode.exempt { sessionId, exempt } (v0.8.0)            单会话豁免切换 (高峰照常发送)
+			// mode.debug  { debug: auto|peak|offpeak } (v0.8.3)     强制当前时段 (调试; 客户端拦截与服务端派发同口径)
+			// diag        { event, ...} (v0.8.3)                    客户端诊断上报 (落 log/taskqueue/offpeak-debug.log)
+			// diag.get    → { recent, file }                        回读最近诊断 (无控制台远程取证)
 			// add         { content, sessionId }                    客户端拦截后入队 (绑指定会话,
 			//                                                        与 queue_add 工具同路径, 零 token)
 			case "mode.get": {
 				const mode = await readMode();
 				const windowsNow = await resolveWindows();
-				return { ok: true, value: {
-					enabled: mode.enabled,
-					peak: isBeijingPeak(windowsNow),
-					windowSource,
-					exempt: mode.exempt
-				} };
+				return { ok: true, value: { ...modeValue(mode, windowsNow, windowSource), diag: diagRecent.slice(-8) } };
 			}
 			case "mode.set": {
 				const enabled = payload?.enabled === true;
 				const cur = await readMode();
-				await writeMode({ enabled, exempt: cur.exempt });
+				await writeMode({ enabled, exempt: cur.exempt, debug: cur.debug });
 				const windowsNow = await resolveWindows();
-				return { ok: true, value: {
-					enabled,
-					peak: isBeijingPeak(windowsNow),
-					windowSource,
-					exempt: cur.exempt
-				} };
+				return { ok: true, value: modeValue({ enabled, exempt: cur.exempt, debug: cur.debug }, windowsNow, windowSource) };
 			}
 			case "mode.exempt": {
 				const sessionId = typeof payload?.sessionId === "string" ? payload.sessionId : "";
@@ -1104,14 +1506,34 @@ export async function apply(ctx, config) {
 				const exemptMap = { ...cur.exempt };
 				if (exempt) exemptMap[sessionId] = true;
 				else delete exemptMap[sessionId];
-				await writeMode({ enabled: cur.enabled, exempt: exemptMap });
+				await writeMode({ enabled: cur.enabled, exempt: exemptMap, debug: cur.debug });
 				const windowsNow = await resolveWindows();
-				return { ok: true, value: {
-					enabled: cur.enabled,
-					peak: isBeijingPeak(windowsNow),
-					windowSource,
-					exempt: exemptMap
-				} };
+				return { ok: true, value: modeValue({ enabled: cur.enabled, exempt: exemptMap, debug: cur.debug }, windowsNow, windowSource) };
+			}
+			// v0.8.3 强制时段 (debug): 平峰期实测错峰功能用 —— "peak" = 当作高峰(消息入队/队列不派发),
+			// "offpeak" = 当作平峰(消息直发/到期任务立即派发), "auto" = 恢复官方页判定。
+			case "mode.debug": {
+				const debug = normalizeDebug(payload?.debug);
+				const raw = typeof payload?.debug === "string" ? payload.debug : "";
+				if (raw && debug === "auto" && raw !== "auto") {
+					return { ok: false, error: { code: "bad-request", message: `debug 只接受 ${DEBUG_VALUES.join(" / ")}` } };
+				}
+				const cur = await readMode();
+				await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug });
+				const windowsNow = await resolveWindows();
+				await appendDiag({ event: "mode.debug", debug });
+				return { ok: true, value: modeValue({ enabled: cur.enabled, exempt: cur.exempt, debug }, windowsNow, windowSource) };
+			}
+			// v0.8.3 客户端诊断: 错峰拦截器在浏览器里, 静默失效时无从取证 —— 客户端 apply/渲染/命中都上报。
+			case "diag": {
+				const event = typeof payload?.event === "string" ? payload.event.slice(0, 64) : "unknown";
+				const rest = (payload && typeof payload === "object") ? { ...payload } : {};
+				delete rest.event;
+				await appendDiag({ event, ...rest });
+				return { ok: true, value: { file: DIAG_LOG } };
+			}
+			case "diag.get": {
+				return { ok: true, value: { recent: diagRecent.slice(-20), file: DIAG_LOG } };
 			}
 			case "add": {
 				const content = typeof payload?.content === "string" ? payload.content.trim() : "";
