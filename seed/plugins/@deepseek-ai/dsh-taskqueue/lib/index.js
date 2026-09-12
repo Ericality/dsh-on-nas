@@ -60,7 +60,7 @@ import { KNOWN_SESSION_EVENT_TYPES } from "@deepseek-ai/dsh-session";
  * 斜杠命令:
  *   /queue add <内容>                   入队, 绑当前会话, 等低谷自动执行
  *   /queue add --at "HH:mm|YYYY-MM-DD HH:mm" <内容>   指定时间执行
- *   /queue add --on restart <内容>     容器重启后自动执行 (v0.6.0)
+ *   /queue add --on restart <内容>     容器重启后自动执行 (v0.6.0; v0.8.5 起同样遵循错峰: 高峰重启则等低谷)
  *   /queue add -r <内容>               同 --on restart (v0.6.1, iOS 单横线简写)
  *   /queue list                         查看队列
  *   /queue cancel <id>                  取消
@@ -105,7 +105,8 @@ const DISPATCH_TRAILING_HINT =
 const FALLBACK_WINDOWS = { weekdaysOnly: true, windows: [[9, 12], [14, 18]] };
 
 // ---------- 容器重启检测 (v0.6.0) ----------
-// "重启后发送"时机: 任务在容器重启后的首个 tick 自动派发。
+// "重启后发送"时机: 任务在容器重启后**且处于低谷时段**的首个 tick 自动派发 (v0.8.5 遵循错峰:
+// 重启发生在高峰 → 任务标记 armed 持久化, 等低谷窗口到达再执行; armed 在尝试派发时消费)。
 // 检测依据: 容器重启 = PID1 (dsh-entrypoint) 是全新进程 → /proc/1/stat 的
 // starttime (第22字段) 必然变化; host 的 boot_id 不随容器重启变化, 不可用。
 // 解析: 先按 ")" 切分 (comm 可能含空格/括号), 再取剩余字段第 20 个 (0-based 19)。
@@ -568,10 +569,12 @@ export async function apply(ctx, config) {
 		// 入队唯一提示: notice/banner 横幅 (非 surface 事件, 零 token)
 		// v0.4.1: 内容完整显示不截断 (原 slice(0,40) 截断已去掉, 横幅可折叠长内容无妨)
 		// v0.4.3: openPanel=true → 横幅出现即展开手风琴面板, 新任务可直接编辑 (未派发前)
+		// v0.8.5: 横幅内容行只给短预览 (与 v0.4.1 之前一致), 避免把整段长消息糊在会话里;
+		// 全文仍在队列面板 (横幅内可展开) 中查看/编辑 —— 面板读的是任务状态文件, 不受此处影响。
 		appendQueueBanner(session, {
 			openPanel: true,
 			title: `任务 #${id} 已入队`,
-			lines: [`执行: ${whenText}`, `内容: ${content}`]
+			lines: [`执行: ${whenText}`, `内容: ${oneLine(content).slice(0, 40)}${oneLine(content).length > 40 ? "…" : ""}`]
 		});
 		return { id, when: whenText, engaged };
 	}
@@ -1015,15 +1018,30 @@ export async function apply(ctx, config) {
 			if (autoDisabled) {
 				ctx.logger?.warn?.(`dsh-taskqueue: [fail-safe] 自动派发停用中 (${autoDisabledReason}); 本轮只观测不派发, 待人工 run-now`);
 			}
+			// v0.8.5: 「重启后发送」类任务也遵循错峰出行 —— 重启发生即把这类任务标记为
+			// **已就绪(armed, 持久化)**, 但只有**当前是低谷**才真正派发 (用户在高峰期重启时,
+			// 任务不再立刻按高峰价执行, 而是等低谷窗口)。armed 在"真正尝试派发"时消费掉,
+			// 保持原有语义: 每次重启只尝试一次, 失败/异常保持 pending 等下次重启。
+			if (restartDetected) {
+				for (const t of state.tasks) {
+					if (t.status === "pending" && t.trigger === "restart" && t.armed !== true) {
+						t.armed = true;
+						t.armedAt = new Date().toISOString();
+						changed = true;
+					}
+				}
+			}
 			const due = autoDisabled ? [] : state.tasks.filter((t) => t.status === "pending"
 				&& (t.trigger === "restart"
-					? restartDetected
+					? (t.armed === true && !peakNow) // v0.8.5: 重启已就绪 + 当前低谷 (原来是"一重启就发", 不看时段)
 					: (t.scheduledAt ? now >= Date.parse(t.scheduledAt) : !peakNow))
 				&& !isTaskLocked(state, t));
 			for (const task of due) {
 				try {
 					const agent = await findTargetAgent(state, task);
-					if (!agent) continue; // 该任务无可用会话, 下次再试
+					if (!agent) continue; // 该任务无可用会话, 下次再试 (armed 保留, 下轮低谷继续找)
+					// v0.8.5: 真正尝试派发即消费"重启已就绪"标记 (每次重启只尝试一次)
+					if (task.trigger === "restart" && task.armed === true) { delete task.armed; delete task.armedAt; changed = true; }
 					const sent = await dispatchTask(state, task, agent);
 					if (sent) changed = true;
 				} catch (err) {
@@ -1045,7 +1063,8 @@ export async function apply(ctx, config) {
 			if (restartDetected) {
 				state.lastBootId = bootId;
 				await writeState(state);
-				ctx.logger?.info?.(`dsh-taskqueue: 检测到容器重启 (bootId=${bootId}), restart 触发任务 ${due.filter((t) => t.trigger === "restart").length} 个到期(失败保持排队等下次重启)`);
+				const armedN = state.tasks.filter((t) => t.status === "pending" && t.trigger === "restart" && t.armed === true).length;
+				ctx.logger?.info?.(`dsh-taskqueue: 检测到容器重启 (bootId=${bootId}), restart 触发任务 本次派发 ${due.filter((t) => t.trigger === "restart").length} 个 / 已就绪待低谷 ${armedN} 个${peakNow ? " (当前高峰 → 遵循错峰, 等低谷执行)" : ""}`);
 			}
 			// 2) E: 已派发任务的**完成观测 (claim 驱动)** —— 本段只观测/置终态, **绝不重发**。
 			//    历史 dispatched: 目标会话已含同 messageId 的 user/message → done;
@@ -1241,7 +1260,7 @@ export async function apply(ctx, config) {
 				return { kind: "success", text: [
 					"/queue add <内容>                   入队(绑当前会话), 等低谷自动执行",
 					"/queue add --at \"HH:mm\" <内容>    指定时间执行 (HH:mm 或 YYYY-MM-DD HH:mm)",
-					"/queue add --on restart <内容>     容器重启后自动执行 (每次重启尝试一次, 失败等下次重启)",
+					"/queue add --on restart <内容>     容器重启后、到低谷时段自动执行 (v0.8.5 遵循错峰; 每次重启尝试一次, 失败等下次重启)",
 					"/queue add -r <内容>               同 --on restart (iOS 单横线简写)",
 					"/queue list                         查看队列(含各任务绑定会话)",
 					"/queue cancel <id>                  取消任务(排队中/已派发未执行的均可取消)",
@@ -1261,11 +1280,11 @@ export async function apply(ctx, config) {
 	// ---------- 模型工具 (不依赖客户端斜杠命令, 自然语言即可调用) ----------
 	ctx.tools.register(defineTool({
 		name: "queue_add",
-		description: "把任务加入低谷时段任务队列(任务绑定当前会话执行): 默认等官方低谷价时段(动态解析官方页)自动派发到当前会话执行, 也可用 at 指定时间(北京时区 HH:mm 或 YYYY-MM-DD HH:mm), 或用 when=\"restart\" 指定容器重启后自动派发",
+		description: "把任务加入低谷时段任务队列(任务绑定当前会话执行): 默认等官方低谷价时段(动态解析官方页)自动派发到当前会话执行, 也可用 at 指定时间(北京时区 HH:mm 或 YYYY-MM-DD HH:mm), 或用 when=\"restart\" 指定容器重启后(且在低谷时段)自动派发",
 		parameters: {
 			content: { type: "string", required: true, description: "任务内容" },
 			at: { type: "string", description: "可选指定时间: HH:mm 或 YYYY-MM-DD HH:mm (北京时区)" },
-			when: { type: "string", description: "可选发送时机: restart=容器重启后自动派发 (每次重启尝试一次, 失败等下次重启; 默认缺省=等低谷时段自动派发)" }
+			when: { type: "string", description: "可选发送时机: restart=容器重启后自动派发 (v0.8.5 起同样遵循错峰: 重启发生在高峰时等到低谷再执行; 每次重启尝试一次, 失败等下次重启; 默认缺省=等低谷时段自动派发)" }
 		},
 		output: {
 			schema: {
@@ -1451,7 +1470,7 @@ export async function apply(ctx, config) {
 					trigger: t.trigger ?? null, // v0.6.0: "restart" = 容器重启后派发
 					sessionShort: shortSession(t.sessionId),
 					whenText: t.trigger === "restart"
-						? "等待容器重启"
+						? (t.armed === true ? "重启后 · 等低谷" : "等待容器重启")
 						: (t.scheduledAt
 							? `定于 ${beijingNowString(new Date(t.scheduledAt)).slice(5, 16)}`
 							: (peak ? "等低谷" : "低谷中")),

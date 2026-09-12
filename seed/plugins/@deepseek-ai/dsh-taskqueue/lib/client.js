@@ -21,6 +21,10 @@ window.__ModuleLoader__.load({
 		//    - 斜杠命令不走 session.prompt (走 commands.execute), 天然不受拦截。
 		//    - v0.8.0 单会话豁免: 服务端持久化 exempt map (offpeak-mode.json),
 		//      豁免会话高峰照常发送; 拦截器命中条件加 !exempt[sessionId]。
+		//    - v0.8.5 (2026-09-12): 拦截点**前移**到 conversation.sendSession —— 只在 prompt 层拦截时,
+		//      composer 的本地乐观 echo 已经建好且永不 retire, 表现为"会话里出现一条消息, 刷新后消失"
+		//      (幽灵消息)。前移后命中即返回 {kind:"success"}, 根本不进 beginSubmission:
+		//      会话里只剩「给 agent 的固定提示(转正确认)」+「任务 #N 已入队」横幅。
 		//    - v0.8.3 修复 (2026-09-12): 0.1.2 的会话作用域槽 (conversation.input.left)
 		//      只给 props.sessionId + useSession hook (旧代码读 props.session → 药丸 return null,
 		//      且拦截器唯一兜底捕获一起失效 → 拦截器其实从未安装)。改为「sessions.list 订阅 +
@@ -258,7 +262,7 @@ window.__ModuleLoader__.load({
 		var captureSessionFn = null; // 由 installPromptInterceptor 赋值; 药丸/槽位渲染时把会话实例喂进来
 		var lastPillDiagKey = "";
 		// 诊断状态 (供 CDP/E2E 与用户自查: window.__dshTaskqueueDebug)
-		var debugState = { version: "0.8.3", installed: false, sessionId: null, lastEvent: null, lastAt: 0 };
+		var debugState = { version: "0.8.5", installed: false, sendPatched: false, sessionId: null, lastEvent: null, lastAt: 0 };
 		try { window.__dshTaskqueueDebug = debugState; } catch (e) { /* 非浏览器环境忽略 */ }
 		function diag(controller, event, detail) {
 			debugState.lastEvent = event;
@@ -332,7 +336,76 @@ window.__ModuleLoader__.load({
 			try { proto[CTL_KEY] = controller; } catch (e) { return false; }
 			return true;
 		}
+		/**
+		 * v0.8.5: 在 **conversation.sendSession** 上再加一层拦截, 目的是"根本别建本地乐观 echo"。
+		 * 背景: composer 提交 = sink → `conversation.sendSession(session, text, imageIds, mode, signal)`
+		 *   → `session.beginSubmission(...)`(同步插入一条**本地 submitted echo**, 即 GUI 里"发出去了"的
+		 *   那条消息) → `session.prompt(...)`。只在 prompt 层拦截时, echo 已经建好了: 我们返回模拟成功,
+		 *   而这条消息永远不会被宿主回执 → echo **永不 retire**, 表现为"聊天里出现一条消息, 刷新后消失"
+		 *   (用户实测反馈)。
+		 * 这里前移到 sendSession: 命中错峰 → 调 RPC 入队 + 直接返回 `{kind:"success"}`(composer 清空
+		 *   输入框、草稿/图片按成功处理), **完全不进入 beginSubmission** ⇒ 不产生任何幽灵消息;
+		 *   会话里只剩「给 agent 的固定提示(转正确认 turn)」+「任务 #N 已入队」横幅。
+		 * 兼容性: 只在"开关开 + 高峰 + 无图片 + 文本非空 + 本会话未豁免"时短路, 其余情况**原样转发**
+		 *   给官方实现 (含图片序列化/回执 retirement 逻辑一行未动); session.prompt 那层包装保留作兜底
+		 *   (programmatic `conversation.send()`、子会话等路径仍走 prompt)。
+		 */
+		var patchedSendProtos = new WeakSet();
+		function patchConversationSendSession(controller, conversation) {
+			if (!conversation) return false;
+			var proto = Object.getPrototypeOf(conversation);
+			if (!proto) return false;
+			if (!patchedSendProtos.has(proto)) {
+				var origSend = proto.sendSession;
+				if (typeof origSend !== "function") {
+					diag(controller, "patch.no-sendSession", { proto: String((proto.constructor && proto.constructor.name) || "?") });
+					return false;
+				}
+				proto.sendSession = async function (session, text, imageIds, mode, signal) {
+					var ctl = this[CTL_KEY] || controller;
+					try {
+						var ids = Array.isArray(imageIds) ? imageIds : [];
+						var body = typeof text === "string" ? text.trim() : "";
+						if (ids.length === 0 && body !== "") {
+							var status = ctl ? await ctl.getStatus() : null;
+							if (status && status.enabled === true && status.peak === true) {
+								var sessionId = session && (session.sessionId || session.id);
+								var exempt = !!(status.exempt && sessionId && status.exempt[sessionId] === true);
+								if (sessionId && !exempt) {
+									var res = await ctl.addTask(body, sessionId);
+									if (res && res.ok) {
+										diag(ctl, "hit.queued", {
+											sessionId: sessionId, chars: body.length, debug: status.debug,
+											taskId: res.value && res.value.id, engaged: !!(res.value && res.value.engaged),
+											via: "sendSession" // v0.8.5: 未建本地 echo (无幽灵消息)
+										});
+										return { kind: "success" }; // 官方 composer 只判 kind
+									}
+									diag(ctl, "hit.add-failed", { sessionId: sessionId, via: "sendSession", error: (res && res.error) || null });
+								}
+							}
+						}
+					} catch (e) { diag(ctl, "hit.error", { via: "sendSession", error: String((e && e.message) || e) }); }
+					return origSend.call(this, session, text, imageIds, mode, signal);
+				};
+				patchedSendProtos.add(proto);
+				try { debugState.conversationRef = conversation; } catch (e) { /* 调试引用失败忽略 */ }
+				diag(controller, "interceptor.sendSession", { why: "patched" });
+			}
+			try { proto[CTL_KEY] = controller; } catch (e) { return false; }
+			return true;
+		}
+
 		function installPromptInterceptor(ctx, controller) {
+			// v0.8.5: 第一优先 —— 包装 conversation.sendSession (composer 的真实入口, 在建本地 echo 之前)
+			try {
+				var conversation = ctx.get("conversation");
+				// 调试/E2E 引用: 无论包装成败都暴露 (便于真浏览器测试直接走官方 composer 入口)
+				try { if (conversation) debugState.conversationRef = conversation; } catch (e) { /* ignore */ }
+				var okSend = patchConversationSendSession(controller, conversation);
+				debugState.sendPatched = okSend === true;
+				diag(controller, "apply.conversation", { hasConversation: !!conversation, sendSessionPatched: debugState.sendPatched });
+			} catch (e) { diag(controller, "patch.sendSession-error", { error: String((e && e.message) || e) }); }
 			// 供药丸/槽位在渲染时把会话实例喂进来 (渲染必然早于发送)
 			captureSessionFn = function (s) {
 				if (!s) return false;
@@ -372,13 +445,29 @@ window.__ModuleLoader__.load({
 				} catch (e) { diag(controller, "subscribe.error", { error: String((e && e.message) || e) }); }
 			}
 			// c) 兜底: 订阅也没拿到时, 短时重试 (会话列表/作用域就绪有延迟)
+			//    v0.8.5: 同时重试 conversation.sendSession 包装 (该服务若在本插件 apply 时尚未就绪)
 			//    整段 try/catch: 定时器不可用/异常绝不能让 apply 中断 (否则药丸与设置卡都不注册)
 			try {
+				// ⚠️ 实测: `conversation` 服务在 apply 时**通常还没就绪** (cordis 只按 exports.inject
+				//    ["slots","locale","connection","sessions"] 门控 apply), sendSession 包装实际是靠这里
+				//    的补挂完成的 —— 因此窗口给足 2 分钟 (60 次), 只在两者都完成时提前退出。
 				var tries = 0;
 				var timer = setInterval(function () {
 					tries += 1;
-					if (debugState.installed || tries > 10) { clearInterval(timer); return; }
+					if (debugState.installed && debugState.sendPatched) { clearInterval(timer); return; }
+					if (tries > 60) {
+						clearInterval(timer);
+						if (!debugState.sendPatched) diag(controller, "sendSession.give-up", { tries: tries - 1 });
+						return;
+					}
 					seed();
+					try {
+						var convNow = ctx.get("conversation");
+						if (convNow) {
+							try { debugState.conversationRef = convNow; } catch (e) { /* ignore */ }
+							if (!debugState.sendPatched) debugState.sendPatched = patchConversationSendSession(controller, convNow);
+						}
+					} catch (e) { /* 下轮再试 */ }
 				}, 2000);
 				ctx.effect(function () { return function () { clearInterval(timer); }; }, "ui-taskqueue: 错峰拦截器安装重试");
 			} catch (e) { diag(controller, "retry.unavailable", { error: String((e && e.message) || e) }); }
