@@ -443,16 +443,59 @@ export async function apply(ctx, config) {
 		}
 	}
 
+	// ---------- 会话日志读取 (v0.8.4, 0.1.2 适配) ----------
+	// ⚠️ 0.1.2-rc.1 起宿主 `Session` **没有 `events` 属性**了 (dsh-session: 只有
+	// header/surface/seq/eventAt/snapshotEvents()/ownEvents())。历史上有 5 处读
+	// `session.events`, 于是全部静默失效 —— 其中**最严重的是 blank 判定**:
+	// `Array.isArray(session?.events)` 恒 false ⇒ blank 恒 false ⇒ 「新会话转正」
+	// (v0.3.1 的防串台机制) **从未触发**, GUI 会继续把 blank 会话当"新会话"复用,
+	// 多个任务落进同一个新会话 (2026-09-12 用户实测反馈)。
+	// 统一走本 helper: 旧版取 session.events, 0.1.2 取 snapshotEvents()/ownEvents()。
+	function readSessionEvents(session) {
+		if (!session) return null;
+		if (Array.isArray(session.events)) return session.events; // < 0.1.2
+		try {
+			if (typeof session.snapshotEvents === "function") return session.snapshotEvents();
+		} catch { /* 日志不可读 → 试下一个 */ }
+		try {
+			if (typeof session.ownEvents === "function") return session.ownEvents();
+		} catch { /* 都拿不到 */ }
+		return null;
+	}
+	/**
+	 * 是否仍是 GUI 里的"新会话"(blank)。
+	 * 与宿主同口径 (dsh-api-session-controller 服务端半: `blank = metadata?.blank ?? session.seq === 0`,
+	 * 增量规则 `state.blank && event.type !== "turn/start"`): 日志里没有 turn/start 即 blank。
+	 * 读不到日志 → 返回 false (fail-safe: 宁可不发转正确认 turn, 也不误发/抛错)。
+	 */
+	function isBlankSession(session) {
+		if (!session) return false;
+		if (typeof session.seq === "number" && session.seq === 0) return true; // 空日志必为 blank
+		const events = readSessionEvents(session);
+		if (events === null) return false;
+		return !events.some((e) => e && e.type === "turn/start");
+	}
+	/** 日志里是否已有某类型事件 (读不到日志 → null = 未知, 由调用方决定默认) */
+	function hasSessionEvent(session, type) {
+		const events = readSessionEvents(session);
+		if (events === null) return null;
+		return events.some((e) => e && e.type === type);
+	}
+
 	// ---------- 入队 (v0.3.1 统一入口: 命令 add / 工具 queue_add 共用) ----------
 	// 默认模式: 任务绑当前会话; 会话若为 blank(无 turn/start, 即 GUI 里的"新会话"),
 	// 立即 followup 一条极简确认消息让 agent 跑一个轻量 turn 完成"转正" ——
 	// 产生真实 turn/start → 侧边栏可见、离开不消失、不会被 connectWorkspace 当
 	// 新会话复用。确认 turn 只回一句"已创建, 等待派发", 不执行任何操作。
 	// config.ownSession=true 时保留 v0.3.0 行为: 排队即新建专属会话。
-	async function enqueueTask({ state, id, content, at, when, agent, sessionId: explicitSessionId }) {
+	async function enqueueTask({ state, id, content, at, when, agent: agentIn, sessionId: explicitSessionId }) {
+		const explicit = explicitSessionId ?? null;
+		// v0.8.4: 只给 sessionId 的调用方 (高峰期客户端拦截 RPC add) 内部反查 live agent ——
+		// 否则拿不到 session ⇒ blank 判定(转正) 与队列横幅都会静默丢失
+		const agent = agentIn ?? (explicit ? ctx.agents?.get?.(explicit) ?? null : null);
 		const session = agent?.session;
 		// v0.7.0: RPC add (客户端错峰拦截) 无 agent 但带明确 sessionId → 优先用显式会话绑定
-		const sessionId = explicitSessionId ?? agent?.id ?? session?.id ?? null;
+		const sessionId = explicit ?? agent?.id ?? session?.id ?? null;
 		const task = {
 			id, content, createdAt: new Date().toISOString(), status: "pending",
 			...(sessionId ? { sessionId } : {}),
@@ -465,6 +508,7 @@ export async function apply(ctx, config) {
 			: when === "restart"
 				? "容器重启后"
 				: "等低谷时段自动执行";
+		let engaged = false; // v0.8.4: 是否因本任务触发 blank 会话转正 (确认 turn)
 		if (cfg.ownSession) {
 			// 专属会话模式 (默认关闭): 排队时新建独立会话
 			const cwd = session?.header?.cwd;
@@ -477,11 +521,18 @@ export async function apply(ctx, config) {
 				ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${id} 专属会话创建失败, 回退绑定当前会话: ${String(err?.message ?? err)}`);
 			}
 		} else {
-			// 默认模式: blank 会话 → 极简确认 turn 转正
-			// 2026-09-10 (0.1.2 适配): session.events 已不可用 → 无法判定 blank 时按"非 blank"处理
-			// (fail-safe: 宁可不发转正确认 turn, 也不因读不到而误发/抛错; 旧写法直接抛
-			//  "Cannot read properties of undefined (reading 'some')" 会让 /queue add 整条失败)
-			const blank = Array.isArray(session?.events) && !session.events.some((e) => e.type === "turn/start");
+			// 默认模式: blank 会话 → 极简确认 turn 转正 (防串台: GUI 会复用 blank 会话当"新会话")
+			// v0.8.4 (2026-09-12): 0.1.2 起 `session.events` 已不存在, 旧写法
+			// `Array.isArray(session?.events)` 恒 false ⇒ blank 恒 false ⇒ **转正从未触发**;
+			// 改用 isBlankSession() (与宿主同口径: 日志无 turn/start 即 blank)。
+			// 同一 blank 会话在"第一个确认 turn 真正开始前"连发多条消息时, 不要重复投确认 turn
+			// (turn/start 出现前 session 仍是 blank; 已有 pending 的 confirmMessageId 即视为转正中)
+			const engaging = state.tasks.some((t) => t.sessionId === sessionId && t.status === "pending" && t.confirmMessageId);
+			const blank = !engaging && isBlankSession(session);
+			if (blank && !agent) {
+				ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${id} 命中 blank 会话 ${shortSession(sessionId)} 但该会话无 live agent, 无法转正 (会话仍会被 GUI 当"新会话"复用)`);
+				void appendDiag({ event: "enqueue.blank-no-agent", taskId: id, sessionId: shortSession(sessionId) });
+			}
 			if (blank && agent) {
 				try {
 					const confirm = createUserMessage({
@@ -491,14 +542,18 @@ export async function apply(ctx, config) {
 					task.ownSession = true; // 标记: 会话因本任务转正(取消时可归档移出列表)
 					task.confirmMessageId = confirm.id;
 					agent.followup(confirm);
+					engaged = true;
+					void appendDiag({ event: "enqueue.engaged", taskId: id, sessionId: shortSession(sessionId) });
 				} catch (err) {
 					ctx.logger?.warn?.(`dsh-taskqueue: 任务 #${id} 转正确认消息投递失败: ${String(err?.message ?? err)}`);
+					void appendDiag({ event: "enqueue.engage-failed", taskId: id, error: String(err?.message ?? err) });
 				}
 			}
 		}
 		// 自动标题 (v0.3.1): 入队即设, agent 第一次回复前标题必然已在; 不覆盖已有标题
 		try {
-			const hasTitle = session?.events?.some((e) => e.type === "session/title");
+			// v0.8.4: 0.1.2 起 session.events 不存在 → readSessionEvents(); 读不到(null)按"无标题"处理(旧行为)
+			const hasTitle = hasSessionEvent(session, "session/title") === true;
 			if (session && !hasTitle) {
 				session.append("session/title", {
 					title: `任务 #${id} · ${oneLine(content).slice(0, 20)}`,
@@ -518,7 +573,7 @@ export async function apply(ctx, config) {
 			title: `任务 #${id} 已入队`,
 			lines: [`执行: ${whenText}`, `内容: ${content}`]
 		});
-		return { id, when: whenText };
+		return { id, when: whenText, engaged };
 	}
 
 	/** v0.5.0: 已派发且派发消息仍在目标会话收件箱排队 (未被 claim 执行) —— "排队发送中",
@@ -666,7 +721,7 @@ export async function apply(ctx, config) {
 		if (!task.messageId) return false;
 		if (claimedMsgIds.has(task.messageId)) return true; // 0.1.2: 观察者维护的权威来源
 		try {
-			const evs = agent?.session?.events ?? [];
+			const evs = readSessionEvents(agent?.session) ?? []; // v0.8.4: 0.1.2 适配 (原 session.events 恒 undefined)
 			for (let i = evs.length - 1; i >= 0; i--) {
 				const e = evs[i];
 				if (e.type === "user/message" && e.data?.id === task.messageId) return true;
@@ -827,10 +882,9 @@ export async function apply(ctx, config) {
 		// 让派发窗口在侧边栏立即可辨识 (source.kind="user" 固定标题, 不触发 LLM 生成)。
 		try {
 			const session = agent.session;
-			// 2026-09-10: session.events 不可用 → 改为内存跟踪"本会话是否已由本插件设过标题"
-			const hasTitle = Array.isArray(session?.events)
-				? session.events.some((e) => e.type === "session/title")
-				: titledSessions.has(String(session?.id ?? ""));
+			// v0.8.4: 优先读会话日志 (0.1.2 用 snapshotEvents); 日志不可读时退回内存集合 (2026-09-10 的兜底)
+			const titleInLog = hasSessionEvent(session, "session/title");
+			const hasTitle = titleInLog === null ? titledSessions.has(String(session?.id ?? "")) : titleInLog;
 			if (session && !hasTitle) {
 				const title = `任务 #${task.id} · ${oneLine(task.content).slice(0, 20)}`;
 				session.append("session/title", {
@@ -872,7 +926,7 @@ export async function apply(ctx, config) {
 		try {
 			if (agent.inbox?.nextTurn?.some((m) => m.id === task.messageId)) return true;
 			if (agent.inbox?.nextStep?.some((m) => m.id === task.messageId)) return true;
-			const evs = agent.session?.events ?? [];
+			const evs = readSessionEvents(agent?.session) ?? []; // v0.8.4: 0.1.2 适配
 			for (let i = evs.length - 1; i >= 0; i--) {
 				const e = evs[i];
 				if (e.type === "user/message" && e.data?.id === task.messageId) return true;
@@ -1549,7 +1603,8 @@ export async function apply(ctx, config) {
 					// 绑客户端传来的会话: 先查 live agent (有则走完整入队含转正/横幅), 无则仅绑会话 id
 					const agent = ctx.agents?.get?.(sessionId) ?? null;
 					const r = await enqueueTask({ state, id, content, at: null, when: null, agent, sessionId });
-					return { ok: true, value: { id: r.id, when: r.when } };
+					// v0.8.4: 回传 engaged (blank 会话已发转正确认 turn) —— 客户端诊断用, 也可远程确证防串台机制生效
+					return { ok: true, value: { id: r.id, when: r.when, engaged: r.engaged === true } };
 				});
 			}
 			default:

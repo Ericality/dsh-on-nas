@@ -313,7 +313,8 @@ window.__ModuleLoader__.load({
 								if (!exempt) {
 									var res = await ctl.addTask(text, sessionId);
 									if (res && res.ok) {
-										diag(ctl, "hit.queued", { sessionId: sessionId, chars: text.length, debug: status.debug, taskId: res.value && res.value.id });
+										// engaged = 服务端把该 blank 会话转正了 (发了确认 turn, 防 GUI 复用新会话导致串台)
+										diag(ctl, "hit.queued", { sessionId: sessionId, chars: text.length, debug: status.debug, taskId: res.value && res.value.id, engaged: !!(res.value && res.value.engaged) });
 										// 模拟 prompt 成功 (composer 清空输入框; 队列横幅由服务端注入, 消息不进 LLM)
 										return { ok: true, value: { accepted: true } };
 									}
