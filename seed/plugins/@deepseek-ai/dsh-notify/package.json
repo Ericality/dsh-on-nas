@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-notify",
-  "version": "0.2.1",
-  "description": "Task-completion push notifications: Bark (multi-device) + Synology Chat webhook (local helper plugin, not an official package)",
+  "version": "0.5.4",
+  "description": "Task-completion push notifications (v0.5.4: ask_user_question-only question push, v0.5.3 format) to Synology Chat webhook / Bark",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

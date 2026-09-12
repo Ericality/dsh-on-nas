@@ -27,3 +27,8 @@
         # synologyWebhookUrl: 'https://<你的群晖>/webapi/entry.cgi?api=SYNO.Chat.External&method=incoming&version=2&token=%22<你的TOKEN>%22'
         # 可选: Bark 多设备
         # barkKeys: ['<你的Bark Key>']
+
+# dsh-auth-mfa (2026-09-12 · Stage 3): 登录二次验证管理卡（/mfa 页 + /auth-mfa RPC）
+- insert:
+    - id: dsh-auth-mfa
+      name: '@deepseek-ai/dsh-auth-mfa'
