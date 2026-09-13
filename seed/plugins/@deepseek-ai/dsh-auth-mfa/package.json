@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-auth-mfa",
-  "version": "0.1.0",
-  "description": "登录二次验证 (MFA/TOTP) 管理卡 (本地辅助插件, 非官方包): 设置 > 本地插件 折叠胶囊卡, 经已认证 RPC /auth-mfa (status/seed/enable/regenerate/disable/purge/revokeDevice/revokeAll/unlock) 以本地 IPC 令牌 X-DSH-MFA-Token 调 auth-proxy 的 /mfa/api/* —— 状态/种子指纹/信任设备/恢复码/二维码/吊销/解锁与 /mfa 页同等能力; 种子与恢复码默认折叠、显式点击才取, 令牌只读不落日志",
+  "version": "0.2.0",
+  "description": "登录二次验证 (MFA/TOTP) 管理卡 (本地辅助插件, 非官方包): 设置 > 本地插件 折叠胶囊卡, 经已认证 RPC /auth-mfa (status/seed/enable/regenerate/disable/purge/revokeDevice/revokeAll/unlock/setOtp) 以本地 IPC 令牌 X-DSH-MFA-Token 调 auth-proxy 的 /mfa/api/* —— 状态/种子指纹/信任设备/恢复码/二维码/吊销/解锁与 /mfa 页同等能力; 种子与恢复码默认折叠、显式点击才取, 令牌只读不落日志; Stage 5 起含手机一次性码开关 setOtp{otpEnabled,autoSend}",
   "type": "module",
   "main": "lib/index.js",
   "exports": {

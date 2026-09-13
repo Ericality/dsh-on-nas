@@ -74,7 +74,35 @@ window.__ModuleLoader__.load({
 			confirmEnableReuse: "（已有种子 ⇒ 沿用现有种子与恢复码，旧验证器继续可用）",
 			confirmEnableUnknown: "（如已有种子则沿用现有种子，旧验证器继续可用）",
 			enableDisabledHint: "已启用；如需更换种子请用「重新生成种子」",
-			recoveryEmpty: "未显示的恢复码不可找回，请用「重新生成种子」获取 8 个新码"
+			recoveryEmpty: "未显示的恢复码不可找回，请用「重新生成种子」获取 8 个新码",
+			// ---------- Stage 5 (2026-09-13): 手机一次性码开关（契约 §4）----------
+			otpTitle: "手机一次性码",
+			otpHint: "登录验证码页可「发送验证码到手机」；受 1 次/60s · 3 次/5 分钟限速，码只出现在通知里",
+			otpAutoLabel: "进入验证码页自动发送",
+			otpAutoHint: "有效期内重复进入不会重复发送（服务端去重），也不占配额",
+			otpOn: "已开启",
+			otpOff: "已关闭",
+			otpCodes: " · 待用码 ",
+			otpNeedMfa: "需先启用二次验证（MFA 关时手机码无意义：登录不进验证码态）",
+			otpNotEffective: "暂不生效（总开关未开）",
+			otpNoHub: "未配置通知设备，发送会失败 —— 去「通知」卡配置设备与 auth.otp 路由",
+			// 用户裁定（2026-09-13）：**自动保存** —— 拨动开关立即写盘，不再有"保存"按钮与未保存提示
+			otpSaved: "✓ 已保存",
+			otpSaving: "正在保存…",
+			otpSavedField: function (name) { return "✓ 已保存：" + name; },
+			otpFailField: function (name) { return "保存失败（" + name + "）："; },
+			otpSaveFail: "保存失败，已还原为服务端的实际值",
+			// ---------- Stage 5 裁决 R2: 错误码 → 友好文案（与 /mfa 页口径一致，不再裸显示 mfa_off 之类代号）----------
+			errMap: {
+				"bad-request": "请求参数不合法（两个开关至少要改一个）",
+				"bad_origin": "请求来源校验失败（请刷新页面后重试）",
+				"unauthorized": "本地管理令牌被拒绝（令牌已轮换? 请重试或核对 auth-proxy 日志）",
+				"mfa_off": "需先启用二次验证（MFA 关时手机码无意义：登录不进验证码态）",
+				"method_not_allowed": "接口不支持该方法（镜像版本可能不匹配）",
+				"forbidden": "auth-proxy 拒绝该请求",
+				"not-found": "auth-proxy 未提供该接口（镜像可能仍是旧版本）"
+			},
+			errUnknown: "操作失败"
 		};
 
 		// ---------- 样式 (mf- 家族; 零新增配色: 只用 --dsw-alias-* 语义变量 + color-mix) ----------
@@ -104,6 +132,13 @@ window.__ModuleLoader__.load({
 			".mf-btn-danger{color:var(--dsw-alias-state-danger-primary,#ef4444);border-color:color-mix(in srgb,var(--dsw-alias-state-danger-primary,#ef4444) 42%,transparent)}",
 			".mf-btn-danger:hover:not(:disabled){background:color-mix(in srgb,var(--dsw-alias-state-danger-primary,#ef4444) 14%,transparent);border-color:color-mix(in srgb,var(--dsw-alias-state-danger-primary,#ef4444) 42%,transparent)}",
 			".mf-chk{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--dsw-alias-label-secondary);cursor:pointer;user-select:none}",
+			// ---------- Stage 5: 手机一次性码开关行 (两行 + 状态文案 + 提示) ----------
+			".mf-otp{display:flex;flex-direction:column;gap:6px}",
+			".mf-otp-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--dsw-alias-label-secondary)}",
+			".mf-otp-row .mf-chk{font-size:12px;color:var(--dsw-alias-label-primary)}",
+			".mf-otp-st{font-size:11.5px;line-height:16px;color:var(--dsw-alias-label-tertiary)}",
+			".mf-otp-st[data-on=\"true\"]{color:var(--dsw-alias-state-success-primary,#22c55e);font-weight:600}",
+			".mf-otp-warn{margin:0}",
 			// 风险提示行 (.risk 同款 warn 语义色, 零新增家族色)
 			".mf-risk{background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 12%,transparent);border:1px dashed color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 45%,transparent);border-radius:8px;padding:6px 10px;font-size:11.5px;line-height:1.7;color:var(--dsw-alias-state-warn-primary,#f59e0b)}",
 			// 种子区 (默认不渲染; 点击后才有内容)
@@ -144,12 +179,13 @@ window.__ModuleLoader__.load({
 		/** 错误文案: 兼容 host 的 `{ok:false,error:"<串>"}` 与 RPC 层的 `{code,message}` 对象两种形状。 */
 		function errText(res, fallback) {
 			var e = res && res.error;
-			if (typeof e === "string" && e) return e;
-			if (e && typeof e === "object") {
-				var m = e.message || e.code;
-				if (m) return String(m);
-			}
-			return fallback || "操作失败";
+			var raw = "";
+			if (typeof e === "string" && e) raw = e;
+			else if (e && typeof e === "object") raw = String(e.message || e.code || "");
+			// 裁决 R2 (2026-09-13): 已知错误码翻成友好文案（与 /mfa 页同口径）；未知码原样透出（便于排查）
+			if (raw && TXT.errMap && TXT.errMap[raw]) return TXT.errMap[raw];
+			if (raw) return raw;
+			return fallback || TXT.errUnknown;
 		}
 		/**
 		 * status 视图归一: auth-proxy 的 status 既可能把字段放在顶层, 也可能挂在 `status.mfa` 下
@@ -278,7 +314,9 @@ window.__ModuleLoader__.load({
 				purge: function () { return call("purge", {}).then(afterWrite); },
 				revokeDevice: function (id) { return call("revokeDevice", { id: id }).then(afterWrite); },
 				revokeAll: function () { return call("revokeAll", {}).then(afterWrite); },
-				unlock: function (scope, ip) { return call("unlock", ip ? { scope: scope, ip: ip } : { scope: scope || "all" }).then(afterWrite); }
+				unlock: function (scope, ip) { return call("unlock", ip ? { scope: scope, ip: ip } : { scope: scope || "all" }).then(afterWrite); },
+				// Stage 5: 手机一次性码开关（{otpEnabled?, autoSend?} 透传；响应 {ok,otp,changed}）
+				setOtp: function (payload) { return call("setOtp", payload || {}).then(afterWrite); }
 			};
 			/** 写动作成功后刷新状态 (失败不刷新, 保留旧视图 + 结果条报错)。 */
 			function afterWrite(res) {
@@ -308,6 +346,13 @@ window.__ModuleLoader__.load({
 			var msgState = React.useState(null);
 			var msg = msgState[0];
 			var setMsg = msgState[1];
+			// ---------- Stage 5: 手机一次性码开关的本地态（hook 必须在组件顶部无条件调用）----------
+			// 初值 false；服务端 status 到达后由下面的 useEffect 同步为真实值（契约 §4）
+			// 自动保存的"每开关独立 in-flight"标记（不参与渲染 ⇒ useRef）
+			var otpInFlight = React.useRef({ enabled: false, autoSend: false });
+			var otpDraftState = React.useState({ enabled: false, autoSend: false });
+			var otpDraft = otpDraftState[0];
+			var setOtpDraft = otpDraftState[1];
 
 			function say(kind, text) { setMsg({ state: kind, text: String(text || "") }); }
 			/** 统一的写动作包装: 禁用态 + 结果条三态 (busy/ok/err)。 */
@@ -449,6 +494,8 @@ window.__ModuleLoader__.load({
 				])
 			]);
 
+			var otpBlock = null;   // Stage 5: 手机一次性码开关块（otpInfo 缺失 ⇒ null ⇒ 不渲染，零回归）
+
 			// ⑤ 设备列表
 			var devRows = devs.map(function (dev, i) {
 				var id = String((dev && (dev.id || dev.deviceId)) || ("dev" + i));
@@ -495,6 +542,101 @@ window.__ModuleLoader__.load({
 				])
 			]);
 
+			// ---------- Stage 5: 手机一次性码开关 (契约 §4) ----------
+			// 服务端 status 新增 otp:{enabled,autoSend,codes,mfa,notifyHub}（加法；旧 host 未回 ⇒ 降级为"未提供"）。
+			// 注: 契约 §5 要求**必含** enabled/autoSend/codes/notifyHub 四项；`mfa` 是**附加诊断字段**（可缺）——
+			//     本卡对 mfa 只做"有就用、无则不显示"的宽容读取，不做前置依赖（裁决 C1 超集口径）。
+			var otpInfo = data && data.otp && typeof data.otp === "object" ? data.otp : null;
+			var otpOn = !!(otpInfo && (otpInfo.enabled === true || otpInfo.otpEnabled === true));
+			var otpAuto = !!(otpInfo && (otpInfo.autoSend === true || otpInfo.auto === true));
+			var otpCodes = otpInfo && typeof otpInfo.codes === "number" ? otpInfo.codes : null;
+			var otpHub = !otpInfo || otpInfo.notifyHub !== false;   // 未提供 ⇒ 不误报"未配置"
+			// 服务端刷新后同步本地草稿态（值没变则保持同一对象，避免无谓重渲染）
+			React.useEffect(function () {
+				setOtpDraft(function (prev) {
+					return (prev.enabled === otpOn && prev.autoSend === otpAuto) ? prev : { enabled: otpOn, autoSend: otpAuto };
+				});
+			}, [otpOn, otpAuto]);
+			// ★自动保存（用户裁定 2026-09-13）：拨动开关**立即**写盘（乐观更新 + 失败自动回滚到服务端值）。
+			//   为什么可行: setOtp 是幂等的（同值 ⇒ changed:{}），且失败时上游不改盘 ⇒ 回读即真实值。
+			//   为什么不用"保存"按钮: 用户明确要求别二次点击；两个开关各自独立提交（部分字段请求契约已支持）。
+			function applyOtp(field, next) {
+				// ⚠️ 不用 run()：run() 的 busyRef 是**整卡共享**的，若上一次请求还在飞，
+				//   它会 `return` 而**不发请求**（静默丢拨动 = "勾了没保存"，2026-09-13 用户实测踩到）。
+				//   自动保存必须"每次拨动都发"：这里用独立 in-flight 标记（防同一开关连点造成响应乱序），
+				//   并让两个开关的请求互不阻塞。
+				var payload = field === "enabled" ? { otpEnabled: next === true } : { autoSend: next === true };
+				var name = field === "enabled" ? TXT.otpTitle : TXT.otpAutoLabel;
+				if (otpInFlight.current[field] === true) return;   // 同一开关上一次还没回来 ⇒ 忽略这次（避免乱序）
+				otpInFlight.current[field] = true;
+				setOtpDraft(function (prev) {
+					return field === "enabled" ? { enabled: next === true, autoSend: prev.autoSend }
+						: { enabled: prev.enabled, autoSend: next === true };
+				});
+				say("busy", TXT.otpSaving);
+				props.setOtp(payload).then(function (res) {
+					otpInFlight.current[field] = false;
+					if (res && res.ok) {
+						// 回读服务端真值（成功路径也同步一次，防"乐观值与服务端不一致"）
+						say("ok", TXT.otpSavedField(name));
+					} else {
+						// 失败 ⇒ 回滚草稿到服务端真值（上游失败不改盘 ⇒ 回读即真值）
+						setOtpDraft(function (prev) {
+							return field === "enabled" ? { enabled: otpOn, autoSend: prev.autoSend }
+								: { enabled: prev.enabled, autoSend: otpAuto };
+						});
+						say("err", TXT.otpFailField(name) + errText(res, TXT.errUnknown));
+					}
+				}, function (err) {
+					otpInFlight.current[field] = false;
+					say("err", TXT.otpFailField(name) + "RPC 失败: " + String((err && err.message) || err));
+				});
+			}
+			if (otpInfo) {
+				otpBlock = React.createElement("div", { className: "mf-otp", id: "otp-switches", key: "otp" }, [
+					React.createElement("div", { className: "mf-sh", key: "h" }, [
+						TXT.otpTitle,
+						React.createElement("span", { className: "mf-tag", key: "tag" }, "Stage 5"),
+						React.createElement("span", { className: "mf-hint", key: "hint" }, TXT.otpHint)
+					]),
+					React.createElement("div", { className: "mf-otp-row", key: "r1" }, [
+						React.createElement("label", { className: "mf-chk", key: "l" }, [
+							React.createElement("input", {
+								type: "checkbox", key: "cb", id: "otp-enabled",
+								checked: otpDraft.enabled === true,
+								disabled: !enabled,
+								onChange: function (e) { applyOtp("enabled", !!(e && e.target && e.target.checked)); }
+							}, null),
+							TXT.otpTitle
+						]),
+						React.createElement("span", {
+							className: "mf-otp-st", key: "st", id: "otp-state",
+							"data-on": otpDraft.enabled === true ? "true" : "false"
+						}, (otpDraft.enabled === true ? TXT.otpOn : TXT.otpOff)
+							+ (otpDraft.enabled === true && otpCodes !== null ? TXT.otpCodes + otpCodes : "")),
+						!enabled ? React.createElement("span", { className: "mf-hint", key: "nm" }, TXT.otpNeedMfa) : null
+					]),
+					React.createElement("div", { className: "mf-otp-row", key: "r2" }, [
+						React.createElement("label", { className: "mf-chk", key: "l" }, [
+							React.createElement("input", {
+								type: "checkbox", key: "cb", id: "otp-auto",
+								checked: otpDraft.autoSend === true,
+								onChange: function (e) { applyOtp("autoSend", !!(e && e.target && e.target.checked)); }
+							}, null),
+							TXT.otpAutoLabel
+						]),
+						otpDraft.autoSend === true && otpDraft.enabled !== true
+							? React.createElement("span", { className: "mf-hint", id: "otp-auto-note", key: "n" }, TXT.otpNotEffective)
+							: null,
+						React.createElement("span", { className: "mf-hint", key: "h" }, TXT.otpAutoHint),
+						React.createElement("span", { className: "mf-hint", id: "otp-autosave-hint", key: "as" }, "改动即保存（无需点保存）")
+					]),
+					!otpHub
+						? React.createElement("p", { className: "mf-risk risk mf-otp-warn", id: "otp-hub-warn", key: "w" }, TXT.otpNoHub)
+						: null,
+				]);
+			}
+
 			// ② 结果条 (#mfa-msg) —— 成功/失败文案 + 进行中
 			var msgEl = React.createElement("div", {
 				className: "mf-msg", id: "mfa-msg",
@@ -510,6 +652,7 @@ window.__ModuleLoader__.load({
 					React.createElement("span", { className: "mf-count", id: "mfa-devcount", key: "cnt" }, loaded ? devCountText : TXT.stateLoading),
 					loaded ? null : React.createElement("span", { className: "mf-hint", key: "err" }, state && state.error ? state.error : "")
 				]),
+				otpBlock,   // Stage 5: 手机一次性码开关（null 时不渲染 ⇒ 零回归）
 				// ④ 动作按钮 (启用/停用/重生成+同时吊销/删除种子文件)
 				// 裁决 E17: 已启用 ⇒ 「启用」disabled (enable 是幂等)、换种子走「重新生成种子」
 				React.createElement("div", { className: "mf-acts", key: "acts" }, [
@@ -582,7 +725,11 @@ window.__ModuleLoader__.load({
 				purge: controller.purge,
 				revokeDevice: controller.revokeDevice,
 				revokeAll: controller.revokeAll,
-				unlock: controller.unlock
+				unlock: controller.unlock,
+				// ★Stage 5（2026-09-13 修正）：自动保存用的写入口 —— **必须在这里映射**，
+				//   否则组件里 `props.setOtp` 是 undefined（首版遗漏 ⇒ 真点击时报
+				//   "props.setOtp is not a function"，勾选框看着动了但请求从未发出，审计里 OTP_SET=0）。
+				setOtp: controller.setOtp
 			};
 		}
 

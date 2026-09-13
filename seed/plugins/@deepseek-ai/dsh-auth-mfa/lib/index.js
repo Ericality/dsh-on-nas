@@ -9,11 +9,14 @@ import { readFile, stat } from "node:fs/promises";
  *
  * 契约 (冻结, 不得擅自改):
  *   docs/任务记录/2026-09-12-通知中枢Stage3-契约与决策.md §1.1(令牌) / §2(动作矩阵) / §5(设置卡)
+ *   docs/任务记录/2026-09-13-通知中枢Stage5-契约与决策.md §1(状态字段) / §2(setOtp) / §4(设置卡开关)
  *   docs/任务记录/2026-09-12-本地插件折叠卡-契约.md (设置卡形态)
  *
  * 设计要点:
  *   - 通道 `/auth-mfa`（ctx.connection.rpc.handle，已认证；同 /notify-hub 先例），
- *     方法 1:1 映射契约 §2: status|seed|enable|regenerate|disable|purge|revokeDevice|revokeAll|unlock。
+ *     方法 1:1 映射契约 §2: status|seed|enable|regenerate|disable|purge|revokeDevice|revokeAll|unlock；
+ *     **Stage 5 追加 `setOtp`**（手机一次性码开关，契约 §2：请求 {otpEnabled?, autoSend?}，
+ *     响应 {ok,otp:{enabled,autoSend,codes,mfa},changed:{}}；仅当两个字段都缺 ⇒ 400 bad-request）。
  *   - 实现 = `POST ${DSH_AUTH_PROXY_URL || http://127.0.0.1:3080}/mfa/api/<method>`，
  *     JSON 透传（请求/响应都是 auth-proxy 的形状，本层不加工、不发明字段），
  *     请求头 `X-DSH-MFA-Token: <本地 IPC 令牌>`。
@@ -35,7 +38,11 @@ export const CHANNEL = "/auth-mfa";
  * 未列出的 method 一律本地拒绝并返回 `{ok:false}`，不发出任何 HTTP 请求。
  */
 export const MFA_METHODS = [
-	"status", "seed", "enable", "regenerate", "disable", "purge", "revokeDevice", "revokeAll", "unlock"
+	"status", "seed", "enable", "regenerate", "disable", "purge", "revokeDevice", "revokeAll", "unlock",
+	// Stage 5 (2026-09-13): 手机一次性码开关（总开关 otpEnabled + 自动发 autoSend）——
+	// 契约 docs/任务记录/2026-09-13-通知中枢Stage5-契约与决策.md §2。纯透传到 auth-proxy 的
+	// `/mfa/api/setOtp`（本层不加工形状：响应 {ok,otp:{enabled,autoSend,codes,mfa},changed:{}}）。
+	"setOtp"
 ];
 
 /** 上游超时（契约 §5：8s）。 */
