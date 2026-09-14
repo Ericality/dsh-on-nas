@@ -160,6 +160,8 @@ const PAUSE_SKIP_DIAG_TTL_MS = 5 * 60 * 1000; // 同会话同原因的 skip 诊�
 const PAUSE_ASK_ID = "offpeak-pause";
 // 提问卡选项 (顺序冻结): ① 本回合余下步骤放行 ② 保持暂停至低谷 ③ 持久豁免本会话
 const PAUSE_ASK_OPTIONS = ["继续到本回合结束", "保持暂停至低谷", "豁免本会话（持久，不再暂停/不再询问）"];
+// v0.10.0: 平峰手动暂停没有"低谷"可等 ⇒ 提问卡选项换第三项 (仍是"唯一放行路径"的白名单)
+const PAUSE_ASK_OPTIONS_OFFPEAK = ["继续到本回合结束", "豁免本会话（持久，不再暂停/不再询问）", "保持暂停（等你再操作）"];
 
 // ---------- 容器重启检测 (v0.6.0) ----------
 // "重启后发送"时机: 任务在容器重启后**且处于低谷时段**的首个 tick 自动派发 (v0.8.5 遵循错峰:
@@ -251,6 +253,28 @@ export function effectiveNextOffpeak(mode, windows, now = new Date()) {
 	return { at: nextOffpeakAt(windows, now), synthetic: false };
 }
 
+/** v0.10.0: debug 感知的"某时刻是否高峰" (debug=peak/offpeak 强制; auto 走官方页口径) */
+function peakAtMs(mode, windows, ms) {
+	if (mode?.debug === "peak") return true;
+	if (mode?.debug === "offpeak") return false;
+	return isPeakAtMs(windows, ms);
+}
+
+/**
+ * v0.10.0 (G2 时段自动管理): 当前"时段纪元"标识 —— 同一段连续的高峰/平峰时段内保持**不变**,
+ * 跨边界(含跨周末)才变。用于"每个时段边界只自动应用一次"的记账 (持久化到 offpeak-mode.json.pauseEpoch)。
+ * 算法: 按小时逐级回溯, 直到"上一小时的时段状态"与当前不同 ⇒ 当前时段的起点小时。
+ * ⚠️ 纯函数, 显式传参 (坑 19)。debug=peak/offpeak 参与判定 ⇒ 测试可用它驱动边界。
+ */
+export function currentEpisode(mode, windows, now = new Date()) {
+	const ms = now.getTime();
+	const peak = peakAtMs(mode, windows, ms);
+	let t = Math.floor(ms / 3600000) * 3600000;
+	const limit = t - 14 * 24 * 3600000;
+	while (t > limit && peakAtMs(mode, windows, t - 1) === peak) t -= 3600000;
+	return `${peak ? "peak" : "offpeak"}:${new Date(t).toISOString().slice(0, 13)}`;
+}
+
 /** 北京时区 "HH:MM" (横幅/命令文案用) */
 function beijingHm(d) {
 	return new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(11, 16);
@@ -330,10 +354,14 @@ async function readMode() {
 			enabled: m?.enabled === true,
 			exempt: (m?.exempt && typeof m.exempt === "object" && !Array.isArray(m.exempt)) ? m.exempt : {},
 			debug: normalizeDebug(m?.debug),
-			pause: m?.pause !== false
+			pause: m?.pause !== false,
+			// v0.10.0: 手动覆盖 (null = 自动管理) / 本会话暂停豁免 / 时段纪元记账
+			pauseManual: (m?.pauseManual === true || m?.pauseManual === false) ? m.pauseManual : null,
+			pauseExempt: (m?.pauseExempt && typeof m.pauseExempt === "object" && !Array.isArray(m.pauseExempt)) ? m.pauseExempt : {},
+			pauseEpoch: typeof m?.pauseEpoch === "string" ? m.pauseEpoch : null
 		};
 	} catch {
-		return { enabled: false, exempt: {}, debug: "auto", pause: true };
+		return { enabled: false, exempt: {}, debug: "auto", pause: true, pauseManual: null, pauseExempt: {}, pauseEpoch: null };
 	}
 }
 
@@ -344,7 +372,10 @@ async function writeMode(mode) {
 			enabled: mode?.enabled === true,
 			exempt: (mode?.exempt && typeof mode.exempt === "object" && !Array.isArray(mode.exempt)) ? mode.exempt : {},
 			debug: normalizeDebug(mode?.debug),
-			pause: mode?.pause !== false
+			pause: mode?.pause !== false,
+			pauseManual: (mode?.pauseManual === true || mode?.pauseManual === false) ? mode.pauseManual : null,
+			pauseExempt: (mode?.pauseExempt && typeof mode.pauseExempt === "object" && !Array.isArray(mode.pauseExempt)) ? mode.pauseExempt : {},
+			pauseEpoch: typeof mode?.pauseEpoch === "string" ? mode.pauseEpoch : null
 		};
 		// 原子写 (tmp + rename): 与 taskqueue.json 同纪律, 避免写一半留下残缺 JSON
 		const tmp = `${MODE_FILE}.tmp`;
@@ -388,6 +419,9 @@ function modeValue(mode, windows, windowSource, paused, pauseInstalled) {
 		debug: mode.debug,
 		exempt: mode.exempt,
 		pause: mode.pause !== false,
+		pauseManual: mode.pauseManual ?? null,
+		pauseExempt: (mode.pauseExempt && typeof mode.pauseExempt === "object") ? mode.pauseExempt : {},
+		pauseEpoch: mode.pauseEpoch ?? null,
 		paused: (paused && typeof paused === "object") ? paused : { count: 0, sessions: [] },
 		// v0.9.0 可见性: 暂停闸门自检结果 (false = 本版本宿主不兼容, 暂停路径已停用)
 		pauseInstalled: pauseInstalled !== false
@@ -1334,12 +1368,67 @@ export async function apply(ctx, config) {
 		return `${new Date(now.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10)} ${currentPeakWindowText(windows, now)}`;
 	}
 
-	/** mode.get 的 paused 摘要: { count, sessions:[{sessionId, since, turn, step, nextOffpeakAt}] } */
+	// P1 (2026-09-14 修): mode 文件的**串行化读改写** —— 同文件读写不得并发 (与 STATE_FILE 的 serialized 同纪律)。
+	let modeChain = Promise.resolve();
+	function serializedMode(fn) {
+		const p = modeChain.then(fn, fn);
+		modeChain = p.then(() => {}, () => {});
+		return p;
+	}
+	/** 自有三键 (时段自动管理只准动这三个) */
+	const MODE_POLICY_KEYS = ["pause", "pauseManual", "pauseEpoch"];
+	/**
+	 * **收窄**的原子读改写: 只覆盖 patch 里出现的键, 其余键一律原样保留 (避免"整份写回用旧快照"覆盖并发写入);
+	 * 值真的变化才写盘 (避免每 15s 轮询抖动写)。返回 { mode, wrote }。
+	 * ⚠️ 纪律: 调用方**不得**手列键集去重建 mode 对象 (那是本次事故的根因 —— 手列会丢键)。
+	 */
+	async function patchMode(patch) { return serializedMode(() => patchModeLocked(patch)); }
+	/** ⚠️ 只允许在 serializedMode 段内调用 (否则请用 patchMode) —— 防重入死锁 */
+	async function patchModeLocked(patch) {
+		const cur = await readMode();
+		const next = { ...cur, ...patch };
+		const keys = Object.keys(patch);
+		const changed = keys.some((k) => JSON.stringify(cur[k] ?? null) !== JSON.stringify(next[k] ?? null));
+		if (!changed) return { mode: cur, wrote: false };
+		await writeMode(next);
+		return { mode: next, wrote: true };
+	}
+
+	/**
+	 * v0.10.0 (G2 时段自动管理): 进入新高/平峰时段时自动设定 pause, 并**每个时段边界只应用一次**
+	 *   (用 currentEpisode 记账, 持久化 pauseEpoch; 否则每分钟 tick 都会覆盖用户手动值)。
+	 *   规则: 高峰 ⇒ pause=true 且清手动覆盖; 平峰 ⇒ pause=(手动覆盖===true); 手动切换 ⇒ pauseManual 记账。
+	 * @returns {Promise<object|null>} 应用后的 mode (未跨边界则 null)
+	 */
+	async function syncPausePolicy(now = new Date()) {
+		try {
+			const mode = await readMode();
+			const ws = await resolveWindows();
+			const ep = currentEpisode(mode, ws, now);
+			if (mode.pauseEpoch === ep) return null; // 本时段已应用过 ⇒ 不反复覆盖
+			const peak = peakAtMs(mode, ws, now.getTime());
+			const prevPause = mode.pause, prevEpoch = mode.pauseEpoch;
+			// **只写自有三键** + 串行化 + 值不变不写盘 (P1)
+			const patch = { pauseEpoch: ep };
+			if (peak) { patch.pause = true; patch.pauseManual = null; }   // 进高峰: 自动开 + 清手动覆盖
+			else { patch.pause = mode.pauseManual === true; }            // 进平峰: 默认关; 手动开的保持
+			const { mode: next, wrote } = await patchMode(patch);
+			void appendDiag({ event: "pause.auto", epoch: ep, prevEpoch, peak, pause: next.pause, pauseManual: next.pauseManual, changed: next.pause !== prevPause, wrote, via: "boundary" });
+			ctx.logger?.info?.(`dsh-taskqueue: 时段边界自动应用 — ${peak ? "高峰" : "平峰"} (epoch=${ep}) ⇒ pause=${next.pause}${next.pauseManual === null ? " (自动)" : " (手动覆盖)"}`);
+			if (!next.pause) releaseAllForReason("pause-off");
+			return next;
+		} catch (err) {
+			ctx.logger?.warn?.(`dsh-taskqueue: 时段边界自动应用失败(忽略, 沿用现值): ${String(err?.message ?? err)}`);
+			return null;
+		}
+	}
+
+	/** mode.get 的 paused 摘要: { count, sessions:[{sessionId, since, turn, step, nextOffpeakAt, mode, syntheticNext}] } */
 	function pauseSummary() {
 		const sessions = [];
 		for (const w of pauseWaiters.values()) {
 			if (w.released) continue;
-			sessions.push({ sessionId: w.sessionId, since: w.since, turn: w.turn, step: w.step, nextOffpeakAt: w.nextOffpeakAt, syntheticNext: w.synthetic === true });
+			sessions.push({ sessionId: w.sessionId, since: w.since, turn: w.turn, step: w.step, nextOffpeakAt: w.nextOffpeakAt, syntheticNext: w.synthetic === true, mode: w.mode });
 		}
 		return { count: sessions.length, sessions };
 	}
@@ -1396,22 +1485,26 @@ export async function apply(ctx, config) {
 				if (w.signal?.aborted) { releaseWaiter(w, "abort"); continue; }
 				// 规则②: 读不到模式 = 异常 ⇒ 立即放行 (绝不无限阻塞)
 				if (err || !mode) { releaseWaiter(w, "error"); continue; }
-				if (mode.enabled !== true) { releaseWaiter(w, "mode-off"); continue; }
+				// v0.10.0 真并列: `enabled`(错峰出行) 不再是暂停的释放条件
 				if (mode.pause === false) { releaseWaiter(w, "pause-off"); continue; }
+				if (w.sessionId && mode.pauseExempt?.[w.sessionId]) { releaseWaiter(w, "pause-exempt"); continue; }
 				if (w.sessionId && mode.exempt?.[w.sessionId]) { releaseWaiter(w, "exempt"); continue; }
-				if (!effectivePeak(mode, ws, now)) { releaseWaiter(w, "offpeak"); continue; }
+				// 仅"高峰中停"等低谷; 平峰手动暂停**不自动恢复**(提问卡是唯一放行路径)
+				if (w.mode === "peak" && !peakAtMs(mode, ws, now.getTime())) { releaseWaiter(w, "offpeak"); continue; }
 			} catch { /* 单个等待者判定异常: 保持暂停, 下轮再判 */ }
 		}
 	}
 
 	/** 豁免开关 (RPC mode.exempt 与提问卡③ 共用): 写 offpeak-mode.json 的 exempt map */
 	async function setExemptMap(sessionId, exempt) {
-		const cur = await readMode();
-		const exemptMap = { ...cur.exempt };
-		if (exempt) exemptMap[sessionId] = true;
-		else delete exemptMap[sessionId];
-		await writeMode({ enabled: cur.enabled, exempt: exemptMap, debug: cur.debug, pause: cur.pause });
-		return exemptMap;
+		return serializedMode(async () => {
+			const cur = await readMode();
+			const exemptMap = { ...cur.exempt };
+			if (exempt) exemptMap[sessionId] = true;
+			else delete exemptMap[sessionId];
+			const { mode: next } = await patchModeLocked({ exempt: exemptMap });
+			return next.exempt ?? exemptMap;
+		});
 	}
 
 	/**
@@ -1431,8 +1524,10 @@ export async function apply(ctx, config) {
 					id: PAUSE_ASK_ID,
 					header: "高峰暂停",
 					question: `已进入高峰（${w.windowText}），本会话已暂停在第 ${w.step} 步后。是否继续？`,
-					detail: `低谷时段预计 ${beijingHm(new Date(w.nextOffpeakAt))} 到达；不回答 = 保持暂停至低谷（等待期零 token）。`,
-					options: PAUSE_ASK_OPTIONS.map((label) => ({ label }))
+					detail: w.mode === "offpeak"
+						? "平峰手动暂停：不会自动继续，需要你选择（不回答 = 保持暂停；等待期零 token）。"
+						: `低谷时段预计 ${beijingHm(new Date(w.nextOffpeakAt))} 到达；不回答 = 保持暂停至低谷（等待期零 token）。`,
+					options: (w.mode === "offpeak" ? PAUSE_ASK_OPTIONS_OFFPEAK : PAUSE_ASK_OPTIONS).map((label) => ({ label }))
 				}],
 				agent: w.agent,
 				signal: w.signal
@@ -1441,14 +1536,15 @@ export async function apply(ctx, config) {
 				const answers = Array.isArray(res?.answers) ? res.answers : [];
 				const ans = answers.find((a) => a?.id === PAUSE_ASK_ID) ?? answers[0] ?? null;
 				const selected = Array.isArray(ans?.selected) ? ans.selected : [];
-				const idx = selected.map((s) => PAUSE_ASK_OPTIONS.indexOf(s)).find((i) => i >= 0);
+				const OPTS = w.mode === "offpeak" ? PAUSE_ASK_OPTIONS_OFFPEAK : PAUSE_ASK_OPTIONS;
+				const idx = selected.map((s) => OPTS.indexOf(s)).find((i) => i >= 0);
 				if (idx === 0) {
 					pauseTurnAllow.add(`${w.sessionId}:${w.turn}`);
 					void appendDiag({ event: "pause.ask", reason: "allow-turn", sessionId: shortSession(w.sessionId) });
 					releaseWaiter(w, "ask-allow-turn");
 					return;
 				}
-				if (idx === 2) {
+				if (OPTS[idx] === PAUSE_ASK_OPTIONS[2] || OPTS[idx] === PAUSE_ASK_OPTIONS_OFFPEAK[1]) { // 「豁免本会话」
 					void appendDiag({ event: "pause.ask", reason: "exempt", sessionId: shortSession(w.sessionId) });
 					void setExemptMap(w.sessionId, true)
 						.then(() => releaseWaiter(w, "ask-exempt"))
@@ -1456,7 +1552,7 @@ export async function apply(ctx, config) {
 					return;
 				}
 				// ② 保持暂停至低谷 / 未识别答案 ⇒ 保持暂停
-				void appendDiag({ event: "pause.ask", reason: idx === 1 ? "stay" : "unparsed", sessionId: shortSession(w.sessionId) });
+				void appendDiag({ event: "pause.ask", reason: idx >= 0 ? "stay" : "unparsed", sessionId: shortSession(w.sessionId) });
 			})
 			.catch((err) => {
 				const msg = String(err?.message ?? err);
@@ -1477,9 +1573,10 @@ export async function apply(ctx, config) {
 			turn: info.turn,
 			signal: info.signal,
 			since: new Date().toISOString(),
-			nextOffpeakAt: info.nextAt.toISOString(),
+			nextOffpeakAt: info.nextAt ? info.nextAt.toISOString() : null, // 平峰手动暂停无 ETA
 			windowText: currentPeakWindowText(info.windowsNow),
 			synthetic: info.synthetic === true,
+			mode: info.mode === "offpeak" ? "offpeak" : "peak",
 			released: false,
 			resolve: null,
 			abortHandler: null
@@ -1491,11 +1588,15 @@ export async function apply(ctx, config) {
 		try {
 			appendQueueBanner(info.session, {
 				state: "warn",
-				title: `⏸ 已暂停 · 高峰窗口 ${w.windowText} · 预计 ${beijingHm(info.nextAt)} 继续（第 ${w.step} 步后）${w.synthetic ? "（debug 模拟低谷边界）" : ""}`,
-				lines: ["等待期零 token（下一步的 LLM 请求已挡住）", "立即继续: 提问卡选「继续到本回合结束」, 或 /queue pause off; 查看: /queue pause"]
+				title: w.mode === "offpeak"
+					? `⏸ 已暂停 · 等待你确认（平峰手动暂停）（第 ${w.step} 步后）`
+					: `⏸ 已暂停 · 高峰窗口 ${w.windowText} · 预计 ${beijingHm(info.nextAt)} 继续（第 ${w.step} 步后）${w.synthetic ? "（debug 模拟低谷边界）" : ""}`,
+				lines: w.mode === "offpeak"
+					? ["平峰手动暂停：**不会自动继续**，请在提问卡里选择（等待期零 token）", "或 /queue pause off 关闭自动暂停以恢复"]
+					: ["等待期零 token（下一步的 LLM 请求已挡住）", "立即继续: 提问卡选「继续到本回合结束」, 或 /queue pause off; 查看: /queue pause"]
 			});
 		} catch { /* 横幅失败不影响暂停 */ }
-		void appendDiag({ event: "pause.enter", sessionId: shortSession(sessionId), step: w.step, turn: w.turn, nextOffpeakAt: w.nextOffpeakAt, window: w.windowText, syntheticNext: w.synthetic });
+		void appendDiag({ event: "pause.enter", sessionId: shortSession(sessionId), step: w.step, turn: w.turn, nextOffpeakAt: w.nextOffpeakAt, window: w.windowText, syntheticNext: w.synthetic, mode: w.mode });
 		// 提问卡: 每会话每高峰窗口最多一次
 		const key = `${sessionId}:${windowKey(info.windowsNow)}`;
 		if (!pauseAsked.has(key)) { pauseAsked.set(key, Date.now()); askPauseChoice(w); }
@@ -1507,7 +1608,9 @@ export async function apply(ctx, config) {
 				if (info.signal.aborted) releaseWaiter(w, "abort");
 			}
 		} catch { /* 无 signal 能力 ⇒ 靠轮询 */ }
+		void appendDiag({ event: "pause.handoff.begin", sessionId: shortSession(sessionId), step: w.step, turn: w.turn, mode: w.mode });
 		await promise;
+		void appendDiag({ event: "pause.handoff.done", sessionId: shortSession(sessionId), step: w.step, turn: w.turn, releasedReason: w.releasedReason });
 	}
 
 	/**
@@ -1519,21 +1622,37 @@ export async function apply(ctx, config) {
 		const step = Number(payload?.step) || 1;
 		const turn = Number(payload?.turn) || 0;
 		const messages = payload?.messages;
-		const mode = await readMode();
+		const mode0 = await readMode();
 		const windowsNow = await resolveWindows();
-		if (mode.enabled !== true) return diagSkip(sessionId, "mode-off");
+		// 时段边界自动管理 (每 epoch 一次; 未跨边界返回 null ⇒ 沿用现值)
+		// P6.3: 加**超时兜底** —— 策略要读窗口/写盘, 绝不允许把闸门(进而 next())拖住; 超时即沿用现值并记诊断
+		let policy = null;
+		try {
+			policy = await Promise.race([
+				syncPausePolicy(),
+				new Promise((r) => { const t = setTimeout(() => r("timeout"), 2500); t?.unref?.(); })
+			]);
+		} catch { policy = null; }
+		if (policy === "timeout") void appendDiag({ event: "pause.policy-timeout", sessionId: shortSession(sessionId) });
+		const mode = (policy && policy !== "timeout") ? policy : mode0;
+		// v0.10.0 真并列: **不再要求 enabled** —— 错峰出行关着时"自动暂停"照样生效
 		if (mode.pause === false) return diagSkip(sessionId, "pause-off");
+		if (sessionId && mode.pauseExempt?.[sessionId]) return diagSkip(sessionId, "pause-exempt");
 		if (sessionId && mode.exempt?.[sessionId]) return diagSkip(sessionId, "exempt");
-		if (!effectivePeak(mode, windowsNow)) return diagSkip(sessionId, "offpeak");
 		if (sessionId && pauseTurnAllow.has(`${sessionId}:${turn}`)) return diagSkip(sessionId, "turn-allowed");
 		if (step < 2) return diagSkip(sessionId, "step1");                                  // 规则①: 第一步永不拦
 		if (!Array.isArray(messages) || messages.length !== 0) return diagSkip(sessionId, "has-messages"); // 规则①: 本步有消息不拦
 		const now = new Date();
-		// debug=peak 时合成"模拟低谷边界"(见 effectiveNextOffpeak); 其余情形与 nextOffpeakAt 完全等价
-		const { at: nextAt, synthetic } = effectiveNextOffpeak(mode, windowsNow, now);
-		// 距低谷不足 PAUSE_MIN_LEAD_MS (含"14 天内无低谷") ⇒ 不暂停
-		if (!nextAt || nextAt.getTime() - now.getTime() < PAUSE_MIN_LEAD_MS) return diagSkip(sessionId, "min-lead");
-		await waitForPause({ sessionId, agent: payload?.agent ?? null, session: payload?.agent?.session ?? null, step, turn, signal: payload?.signal, nextAt, synthetic, windowsNow });
+		const peakNow = peakAtMs(mode, windowsNow, now.getTime());
+		let nextAt = null, synthetic = false;
+		if (peakNow) {
+			// 高峰中停: 等低谷 (debug=peak 时合成"模拟低谷边界"); 距低谷不足 5min ⇒ 不暂停
+			const r = effectiveNextOffpeak(mode, windowsNow, now);
+			nextAt = r.at; synthetic = r.synthetic;
+			if (!nextAt || nextAt.getTime() - now.getTime() < PAUSE_MIN_LEAD_MS) return diagSkip(sessionId, "min-lead");
+		}
+		// 平峰手动暂停: **立刻停**, 无 min-lead、不等低谷, 提问卡是唯一放行路径
+		await waitForPause({ sessionId, agent: payload?.agent ?? null, session: payload?.agent?.session ?? null, step, turn, signal: payload?.signal, nextAt, synthetic, mode: peakNow ? "peak" : "offpeak", windowsNow });
 	}
 
 	/** RPC 统一返回体: 注入闸门自检结果 (坑 19: 闭包变量必须显式传参, 不用模块级 helper 读闭包) */
@@ -1552,6 +1671,10 @@ export async function apply(ctx, config) {
 				// 规则② fail-open: 闸门内任何异常立即放行 (绝不阻塞、绝不吞消息)
 				void appendDiag({ event: "pause.skip", reason: "error", error: String(err?.message ?? err) });
 			}
+			// P6: 释放后必须"纯内存置位 + 立即 next()" —— next() 不得跨任何锁/网络/文件 IO
+			try { // ⚠️ 诊断自身必须防御: 读 session.id 可能抛 (fail-open 规则② 不许被诊断破坏)
+				if (Number(payload?.step) >= 2) void appendDiag({ event: "pause.handoff.next", step: payload?.step, turn: payload?.turn });
+			} catch { /* 诊断失败不影响放行 */ }
 			return next(); // ⚠️ next() 恰好调用一次 (暂停/放行两条路径都走这里)
 		}, { global: true });
 		ctx.effect(() => () => { if (pauseTimer) { clearInterval(pauseTimer); pauseTimer = null; } });
@@ -1706,7 +1829,7 @@ export async function apply(ctx, config) {
 				if (!DEBUG_VALUES.includes(arg)) {
 					return { kind: "error", text: `用法: /queue debug peak | offpeak | auto (当前: ${cur.debug})` };
 				}
-				await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug: arg, pause: cur.pause });
+				await patchMode({ debug: arg }); // P1: 收窄写
 				await appendDiag({ event: "mode.debug", debug: arg, via: "slash" });
 				if (arg === "offpeak") releaseAllForReason("offpeak"); // 强制平峰 ⇒ 等待中的回合立即恢复
 				const windowsNow = await resolveWindows();
@@ -1727,8 +1850,9 @@ export async function apply(ctx, config) {
 				if (arg === "on" || arg === "off") {
 					const cur = await readMode();
 					const pause = arg === "on";
-					await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug: cur.debug, pause });
-					await appendDiag({ event: pause ? "pause.switch-on" : "pause.switch-off", via: "slash" });
+					// v0.10.0: 命令切 pause = **手动覆盖** (记 pauseManual); P1: 收窄写
+					await patchMode({ pause, pauseManual: pause });
+					await appendDiag({ event: pause ? "pause.switch-on" : "pause.switch-off", via: "slash", pauseManual: pause });
 					if (!pause) releaseAllForReason("pause-off");
 					return { kind: "success", text: [
 						`高峰暂停(全局)已${pause ? "开启" : "关闭"} (offpeak-mode.json 的 pause=${pause})`,
@@ -1742,12 +1866,16 @@ export async function apply(ctx, config) {
 				const sum = pauseSummary();
 				const nx = effectiveNextOffpeak(mode, ws);
 				const nextAt = nx.at;
+				const ex1 = Object.keys(mode.exempt ?? {}).filter((k) => mode.exempt[k]);
+				const ex2 = Object.keys(mode.pauseExempt ?? {}).filter((k) => mode.pauseExempt[k]);
 				return { kind: "success", text: [
 					`暂停闸门: ${pauseGateReason === null ? "已安装" : `未安装(${pauseGateReason})`}`,
-					`高峰暂停(全局): ${mode.pause === false ? "关" : "开"}${mode.enabled ? "" : " (错峰出行模式未开启 ⇒ 不生效)"}`,
+					`自动暂停(G2, 全局): ${mode.pause === false ? "关" : "开"}${mode.pauseManual === null ? " (自动管理)" : ` (手动覆盖 pauseManual=${mode.pauseManual})`} · 时段纪元 epoch=${mode.pauseEpoch ?? "—"}`,
 					`当前时段: ${effectivePeak(mode, ws) ? "高峰" : "平峰"} (${peakSourceText(mode, windowSource)}) · 高峰窗口 ${(ws?.windows ?? []).map(([s, e]) => `${String(s).padStart(2, "0")}:00-${String(e).padStart(2, "0")}:00`).join(" ")}`,
 					`暂停中的回合: ${sum.count} 个`,
-					...sum.sessions.map((s) => `  · ${shortSession(s.sessionId)}: 自 ${beijingHm(new Date(s.since))} 起暂停 (第 ${s.step} 步后) · 预计 ${beijingHm(new Date(s.nextOffpeakAt))} 恢复`),
+					...sum.sessions.map((s) => `  · ${shortSession(s.sessionId)}: 自 ${beijingHm(new Date(s.since))} 起暂停 (第 ${s.step} 步后, ${s.mode === "offpeak" ? "平峰手动暂停·等你确认" : `预计 ${beijingHm(new Date(s.nextOffpeakAt))} 恢复`})`),
+					`错峰豁免(S1) 会话: ${ex1.length ? ex1.map(shortSession).join(", ") : "无"}`,
+					`暂停豁免(S2) 会话: ${ex2.length ? ex2.map(shortSession).join(", ") : "无"}`,
 					`下一个低谷: ${nextAt ? beijingHm(nextAt) : "—"}${nx.synthetic ? "（debug 模拟低谷边界）" : ""} (距不足 5 分钟则不暂停)`,
 					"用法: /queue pause on | off | status"
 				].join("\n") };
@@ -2058,17 +2186,20 @@ export async function apply(ctx, config) {
 			// add         { content, sessionId }                    客户端拦截后入队 (绑指定会话,
 			//                                                        与 queue_add 工具同路径, 零 token)
 			case "mode.get": {
+				await syncPausePolicy(); // 边界自动管理 (每 epoch 一次; UI 15s 轮询即能反映)
 				const mode = await readMode();
 				const windowsNow = await resolveWindows();
 				return { ok: true, value: { ...modeOut(mode, windowsNow), diag: diagRecent.slice(-8) } };
 			}
 			case "mode.set": {
-				const cur = await readMode();
-				// 缺省 = 不改动该字段 (客户端只切一个开关时不会误清另一个); 显式传值时按既有语义取值
-				const next = { enabled: cur.enabled, exempt: cur.exempt, debug: cur.debug, pause: cur.pause };
-				if (payload && Object.prototype.hasOwnProperty.call(payload, "enabled")) next.enabled = payload.enabled === true;
-				if (payload && Object.prototype.hasOwnProperty.call(payload, "pause")) next.pause = payload.pause !== false;
-				await writeMode(next);
+				// 缺省 = 不改动该字段; ⚠️ P1: 用 patchMode **收窄写**, 绝不手列键集重建 mode (会丢 pauseExempt/pauseEpoch)
+				const patch = {};
+				if (payload && Object.prototype.hasOwnProperty.call(payload, "enabled")) patch.enabled = payload.enabled === true;
+				if (payload && Object.prototype.hasOwnProperty.call(payload, "pause")) {
+					patch.pause = payload.pause !== false;
+					patch.pauseManual = patch.pause; // v0.10.0: RPC/命令切 pause = **手动覆盖**
+				}
+				const { mode: next } = await patchMode(patch);
 				if (next.pause === false) releaseAllForReason("pause-off");
 				const windowsNow = await resolveWindows();
 				return { ok: true, value: modeOut(next, windowsNow) };
@@ -2077,26 +2208,35 @@ export async function apply(ctx, config) {
 				if (typeof payload?.pause !== "boolean") {
 					return { ok: false, error: { code: "bad-request", message: "需要 pause(布尔)" } };
 				}
-				const cur = await readMode();
-				const next = { enabled: cur.enabled, exempt: cur.exempt, debug: cur.debug, pause: payload.pause };
-				await writeMode(next);
+				const { mode: next } = await patchMode({ pause: payload.pause, pauseManual: payload.pause }); // 手动覆盖 (收窄写)
 				await appendDiag({ event: payload.pause ? "pause.switch-on" : "pause.switch-off", via: "rpc" });
 				if (!payload.pause) releaseAllForReason("pause-off");
 				const windowsNow = await resolveWindows();
 				return { ok: true, value: modeOut(next, windowsNow) };
 			}
-			case "mode.exempt": {
+			// v0.10.0: payload 支持 {sessionId, exempt?} 与 {sessionId, pauseExempt?} —— 两个会话级豁免同端点 (返回两者)
+			case "mode.exempt": case "mode.pauseExempt": {
 				const sessionId = typeof payload?.sessionId === "string" ? payload.sessionId : "";
-				const exempt = payload?.exempt === true;
 				if (!sessionId) {
 					return { ok: false, error: { code: "bad-request", message: "需要 sessionId(当前会话)" } };
 				}
 				const cur = await readMode();
-				const exemptMap = await setExemptMap(sessionId, exempt);
-				// 豁免本会话 ⇒ 等待中的回合立即恢复执行 (与轮询器同口径, 但不等 15s)
-				if (exempt) { const w = pauseWaiters.get(sessionId); if (w) releaseWaiter(w, "exempt"); }
+				const next = { ...cur };
+				const has1 = payload && Object.prototype.hasOwnProperty.call(payload, "exempt");
+				const has2 = payload && Object.prototype.hasOwnProperty.call(payload, "pauseExempt");
+				if (!has1 && !has2) return { ok: false, error: { code: "bad-request", message: "需要 exempt 或 pauseExempt(布尔)" } };
+				if (has1) await setExemptMap(sessionId, payload.exempt === true);
+				if (has2) {
+					const m = { ...cur.pauseExempt };
+					if (payload.pauseExempt === true) m[sessionId] = true; else delete m[sessionId];
+					await patchMode({ pauseExempt: m }); // P1: 收窄写, 不整份回写
+					// S2 打开 ⇒ 该会话已暂停的回合立即释放 (不等轮询)
+					if (payload.pauseExempt === true) { const w = pauseWaiters.get(sessionId); if (w) releaseWaiter(w, "pause-exempt"); }
+				}
+				if (has1 && payload.exempt === true) { const w = pauseWaiters.get(sessionId); if (w) releaseWaiter(w, "exempt"); }
+				await appendDiag({ event: "mode.exempt", via: "rpc", exempt: has1 ? payload.exempt === true : undefined, pauseExempt: has2 ? payload.pauseExempt === true : undefined, sessionId: shortSession(sessionId) });
 				const windowsNow = await resolveWindows();
-				return { ok: true, value: modeOut({ enabled: cur.enabled, exempt: exemptMap, debug: cur.debug, pause: cur.pause }, windowsNow) };
+				return { ok: true, value: modeOut(await readMode(), windowsNow) };
 			}
 			// v0.8.3 强制时段 (debug): 平峰期实测错峰功能用 —— "peak" = 当作高峰(消息入队/队列不派发),
 			// "offpeak" = 当作平峰(消息直发/到期任务立即派发), "auto" = 恢复官方页判定。
@@ -2107,7 +2247,7 @@ export async function apply(ctx, config) {
 					return { ok: false, error: { code: "bad-request", message: `debug 只接受 ${DEBUG_VALUES.join(" / ")}` } };
 				}
 				const cur = await readMode();
-				await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug, pause: cur.pause });
+				await patchMode({ debug });
 				const windowsNow = await resolveWindows();
 				await appendDiag({ event: "mode.debug", debug });
 				if (debug === "offpeak") releaseAllForReason("offpeak"); // 强制平峰 ⇒ 等待中的回合立即恢复

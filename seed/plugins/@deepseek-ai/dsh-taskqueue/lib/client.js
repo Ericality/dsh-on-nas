@@ -68,8 +68,12 @@ window.__ModuleLoader__.load({
 			descOffpeak: "当前为平峰时段，消息正常发送。",
 			popRowLabel: "本会话立即发送",
 			// v0.9.0: 高峰暂停 (全局子开关 + 本会话暂停态)
-			pauseLabel: "高峰暂停",
-			pauseHint: "高峰时段把正在跑的回合停在步骤边界, 到低谷自动继续 (等待期零 token; 关闭则高峰照常跑完)",
+			pauseLabel: "自动暂停",
+			pauseHint: "在步骤边界停住正在跑的回合 (高峰停到低谷; 平峰手动开则等你确认)。随时段自动管理, 与上面的错峰出行各自独立",
+			autoPeakOn: "开（高峰默认）", autoOffpeakOff: "关（平峰默认）", autoManualOn: "开（手动）", autoManualOff: "关（手动）",
+			pauseExemptRowLabel: "本会话暂停豁免",
+			globalOffHint: "全局未开启，本豁免暂不生效",
+			pausedWaiting: "⏸ 已暂停 · 等待你确认",
 			pauseRowLabel: "高峰暂停 (全局)",
 			pauseAria: "高峰暂停开关 (全局): 高峰期把正在跑的 agent 回合停在步骤边界",
 			pauseBroken: "暂停闸门未安装（本版本宿主不兼容）",
@@ -104,8 +108,12 @@ window.__ModuleLoader__.load({
 			descOffpeak: "Off-peak now: messages send normally.",
 			popRowLabel: "Send now in this session",
 			// v0.9.0: peak-pause (global sub-switch + per-session paused state)
-			pauseLabel: "Peak pause",
-			pauseHint: "During peak hours a running turn is parked at the step boundary and resumes in the off-peak window (zero tokens while waiting; off = peak turns run to completion)",
+			pauseLabel: "Auto-pause",
+			pauseHint: "Parks a running turn at the step boundary (peak waits for the trough; a manual on during off-peak waits for your confirmation). Managed automatically per time window, independent from off-peak travel mode",
+			autoPeakOn: "on (peak default)", autoOffpeakOff: "off (off-peak default)", autoManualOn: "on (manual)", autoManualOff: "off (manual)",
+			pauseExemptRowLabel: "Skip pausing in this session",
+			globalOffHint: "Global switch is off — this exemption has no effect yet",
+			pausedWaiting: "⏸ Paused · waiting for you",
 			pauseRowLabel: "Peak pause (global)",
 			pauseAria: "Peak pause switch (global): park running agent turns at the step boundary during peak hours",
 			pauseBroken: "Pause gate NOT installed (host incompatible)",
@@ -191,7 +199,7 @@ window.__ModuleLoader__.load({
 		var UI_POLL_MS = 15 * 1000;
 
 		function createController(connection) {
-			var store = createSnapshotStore({ status: "loading", loaded: false, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {}, pause: true, paused: { count: 0, sessions: [] }, pauseInstalled: true });
+			var store = createSnapshotStore({ status: "loading", loaded: false, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {}, pause: true, pauseManual: null, pauseExempt: {}, paused: { count: 0, sessions: [] }, pauseInstalled: true });
 			var cached = null; // { at, value }
 			function call(endpoint, payload) {
 				var rpc = connection && connection.rpc;
@@ -227,6 +235,8 @@ window.__ModuleLoader__.load({
 					debug: String(value.debug || "auto"),
 					exempt: (value.exempt && typeof value.exempt === "object") ? value.exempt : {},
 					pause: value.pause !== false,
+					pauseManual: (value.pauseManual === true || value.pauseManual === false) ? value.pauseManual : null,
+					pauseExempt: (value.pauseExempt && typeof value.pauseExempt === "object") ? value.pauseExempt : {},
 					pauseInstalled: value.pauseInstalled !== false, // v0.9.0: 闸门自检失败 ⇒ 设置卡加一句可见提示
 					paused: pausedOf(value)
 				});
@@ -240,7 +250,7 @@ window.__ModuleLoader__.load({
 						publish(res.value);
 						return res.value;
 					}
-					store.set({ status: "error", loaded: true, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {}, pause: true, paused: { count: 0, sessions: [] }, pauseInstalled: true });
+					store.set({ status: "error", loaded: true, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {}, pause: true, pauseManual: null, pauseExempt: {}, paused: { count: 0, sessions: [] }, pauseInstalled: true });
 					return null;
 				});
 			}
@@ -271,6 +281,10 @@ window.__ModuleLoader__.load({
 				// v0.9.0 高峰暂停子开关 (全局): mode.set 只带 pause ⇒ 服务端不动其它字段
 				setPause: function (pause) {
 					return call("mode.set", { pause: pause === true }).then(function (res) { return setter("mode.set", null, res); });
+				},
+				// v0.10.0 S2: 本会话暂停豁免 (同端点 mode.exempt 的 pauseExempt 载荷)
+				setPauseExempt: function (sessionId, pauseExempt) {
+					return call("mode.exempt", { sessionId: sessionId, pauseExempt: pauseExempt === true }).then(function (res) { return setter("mode.exempt", null, res); });
 				},
 				setExempt: function (sessionId, exempt) {
 					return call("mode.exempt", { sessionId: sessionId, exempt: exempt === true }).then(function (res) { return setter("mode.exempt", null, res); });
@@ -587,7 +601,7 @@ window.__ModuleLoader__.load({
 					React.createElement("span", { className: "dsh-tq-status", "data-state": statusState }, statusText),
 					React.createElement("p", { className: "dsh-tq-hint" }, t("modeOnHint")),
 					React.createElement("div", { className: "dsh-tq-mode-row" }, [
-						React.createElement("b", null, t("pauseLabel")),
+						React.createElement("b", null, t("pauseLabel") + "：" + (state.pauseManual === true ? t("autoManualOn") : state.pauseManual === false ? t("autoManualOff") : (state.pause !== false ? t("autoPeakOn") : t("autoOffpeakOff")))),
 						React.createElement("button", {
 							type: "button",
 							className: "dsh-tq-switch",
@@ -652,6 +666,8 @@ window.__ModuleLoader__.load({
 				}
 			} catch (e) { resumeHm = ""; }
 			var paused = !!pausedRec;
+			var pauseExempt = !!(ready && sessionId && state.pauseExempt && state.pauseExempt[sessionId] === true);
+			var pausedOffpeak = !!(pausedRec && pausedRec.mode === "offpeak");
 			var pillState = !ready ? "offpeak" : (paused ? "paused" : (exempt ? "exempt" : (peak ? "peak" : "offpeak")));
 			var label = !ready ? "" : (paused ? t("pillPaused") : (exempt ? t("pillExempt") : (peak ? t("pillPeak") : t("pillOffpeak"))));
 			var desc = !ready ? "" : (paused ? t("descPaused") : (exempt ? t("descExempt") : (peak ? t("descPeak") : t("descOffpeak"))));
@@ -669,13 +685,11 @@ window.__ModuleLoader__.load({
 					busy.current = false;
 				}, function () { busy.current = false; });
 			}
-			// v0.9.0: 全局「高峰暂停」开关 (RPC mode.set {pause}; 失败 ⇒ controller 已回退 UI 到服务端真实状态)
-			function togglePause() {
-				if (busy.current || typeof props.setPause !== "function") return;
+			// v0.10.0 S2: 本会话暂停豁免 (RPC mode.exempt {sessionId, pauseExempt})
+			function togglePauseExempt() {
+				if (busy.current || typeof props.setPauseExempt !== "function" || !sessionId) return;
 				busy.current = true;
-				props.setPause(state.pause === false).then(function () {
-					busy.current = false;
-				}, function () { busy.current = false; });
+				props.setPauseExempt(sessionId, !pauseExempt).then(function () { busy.current = false; }, function () { busy.current = false; });
 			}
 			function toggleOpen() {
 				setOpen(function (v) { return !v; });
@@ -736,41 +750,29 @@ window.__ModuleLoader__.load({
 					window.removeEventListener("resize", place);
 					window.removeEventListener("scroll", place, true);
 				};
-			}, [open, exempt, peak, paused]);
+			}, [open, exempt, peak, paused, pauseExempt, pausedOffpeak]);
 			if (!ready || !sessionId) return null;
 			var popEl = null;
 			if (open) {
 				var rows = [];
-				// v0.9.0: ① 全局「高峰暂停」开关 (服务端 mode.set {pause})
-				rows.push(React.createElement("div", { className: "dsh-tq-pop-row", key: "sw-pause" }, [
-					React.createElement("span", null, t("pauseRowLabel")),
-					React.createElement("button", {
-						type: "button",
-						className: "dsh-tq-sw",
-						"data-tq": "pause-switch",
-						role: "switch",
-						"aria-checked": state.pause !== false,
-						"aria-label": t("pauseAria"),
-						"data-on": state.pause !== false ? "true" : "false",
-												onClick: togglePause
-					})
-				]));
-				// ② 本会话豁免 (v0.8.2 起统一收在弹层; 仅在高峰时有意义)
-				if (peak) {
-					rows.push(React.createElement("div", { className: "dsh-tq-pop-row", key: "sw" }, [
-						React.createElement("span", null, t("popRowLabel")),
-						React.createElement("button", {
-							type: "button",
-							className: "dsh-tq-sw",
-							role: "switch",
-							"aria-checked": exempt,
-							"aria-label": exempt ? t("switchAriaOn") : t("switchAria"),
-							"data-on": exempt ? "true" : "false",
-														onClick: toggleExempt
-						})
-					]));
-				}
-				popEl = React.createElement("div", {
+			// v0.10.0: 弹层里**只有两个会话级豁免开关** (全局两开关已收进设置卡)
+			rows.push(React.createElement("div", { className: "dsh-tq-pop-row", key: "sw-s1" }, [
+				React.createElement("span", null, t("popRowLabel") + (state.enabled ? "" : " · " + t("globalOffHint"))),
+				React.createElement("button", {
+					type: "button", className: "dsh-tq-sw", "data-tq": "exempt-switch", role: "switch",
+					"aria-checked": exempt, "aria-label": exempt ? t("switchAriaOn") : t("switchAria"),
+					"data-on": exempt ? "true" : "false", onClick: toggleExempt
+				})
+			]));
+			rows.push(React.createElement("div", { className: "dsh-tq-pop-row", key: "sw-s2" }, [
+				React.createElement("span", null, t("pauseExemptRowLabel") + (state.pause === false ? " · " + t("globalOffHint") : "")),
+				React.createElement("button", {
+					type: "button", className: "dsh-tq-sw", "data-tq": "pause-exempt-switch", role: "switch",
+					"aria-checked": pauseExempt, "aria-label": t("pauseExemptRowLabel"),
+					"data-on": pauseExempt ? "true" : "false", onClick: togglePauseExempt
+				})
+			]));
+			popEl = React.createElement("div", {
 					ref: popRef,
 					className: "dsh-tq-pop dsh-tq-pop-open",
 					"data-state": pillState,
@@ -783,7 +785,8 @@ window.__ModuleLoader__.load({
 					]),
 					React.createElement("div", { className: "dsh-tq-pop-desc" }, desc),
 					// v0.9.0 状态行: 暂停中显示"已暂停 · 预计 HH:MM 继续"
-					paused && resumeHm ? React.createElement("div", { className: "dsh-tq-pop-desc", "data-tq": "paused-line" }, t("statusPaused").replace("%s", resumeHm)) : null,
+					// v0.10.0: 平峰手动暂停没有 ETA ⇒ 显示"等待你确认"
+					paused ? React.createElement("div", { className: "dsh-tq-pop-desc", "data-tq": "paused-line" }, pausedOffpeak ? t("pausedWaiting") : (resumeHm ? t("statusPaused").replace("%s", resumeHm) : t("pausedWaiting"))) : null,
 					rows
 				]);
 			}
@@ -842,7 +845,7 @@ window.__ModuleLoader__.load({
 						return {
 							hooks: { taskQueue: controller.store },
 							setExempt: controller.setExempt,
-							setPause: controller.setPause, // v0.9.0: 全局高峰暂停开关
+							setPauseExempt: controller.setPauseExempt, // v0.10.0: 本会话暂停豁免 (S2)
 							report: controller.report
 						};
 					}
