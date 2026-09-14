@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { readFile, writeFile, rename, stat, chown, chmod, mkdir, appendFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -95,6 +95,20 @@ const TASK_FAIL_BREAKER = 3;              // 同任务连续 N 次无 claim/派�
 const TICK_FAIL_BREAKER = 5;              // tick 全局连续异常 ≥N 次 → 自动派发路径整体停用
 const CLAIM_TIMEOUT_MS = 10 * 60 * 1000;  // 派发后多久仍无 claim 且不在 inbox → 记一次"未确认"
 const TERMINAL_STATUS = new Set(["done", "failed", "cancelled"]);
+
+/**
+ * v0.8.6 (2026-09-14, 用户拍板「重启状态要有独立标识」): 判定"派发消息被移出 inbox"的来源。
+ *   "restart" = 消息跨越了一次容器重启 (派发时的 boot ≠ 当前 boot, 或该会话观察到的 boot 变了)
+ *               ⇒ 意外/主动重启把 inbox 冲掉, 任务未执行 ⇒ cancelled + dropCause="restart"
+ *   "removed" = 同一次启动内被丢弃 ⇒ 人工删队/主动移除 ⇒ cancelled + dropCause="removed"
+ * 两者都是人工终态(cancelled)而非故障(failed); 真正的派发异常/超时未 claim 仍走 failed 路径。
+ * 纯函数 ⇒ 离线可单测 (scripts/taskqueue-dropcause-test.mjs); 判定失败一律保守回 "removed"。
+ */
+export function dropCauseOf(task, bootNow, sessionSeenBoot) {
+	if (task?.dispatchedBootId && bootNow && task.dispatchedBootId !== bootNow) return "restart";
+	if (sessionSeenBoot && bootNow && sessionSeenBoot !== bootNow) return "restart";
+	return "removed";
+}
 // 派发消息末尾的固定提示 (v0.3.2): 除用户输入的任务内容外, 追加一段指令,
 // 要求 agent 在第一次回答时根据当前对话内容用 session_rename 工具把本会话
 // 标题重命名为贴切的任务标题 —— 派发窗口在侧边栏的标题贴合实际任务。
@@ -103,6 +117,49 @@ const DISPATCH_TRAILING_HINT =
 
 // 内置兜底 (2026-08-23 官方: 周一至周五 9-12/14-18 高峰, 其余空闲)
 const FALLBACK_WINDOWS = { weekdaysOnly: true, windows: [[9, 12], [14, 18]] };
+
+// ---------- v0.9.0: 高峰暂停闸门 (peak pause gate) ----------
+// 错峰出行开启期间, 高峰时段把**正在跑的回合**停在"当前步骤结束后"(agent/pre-step 瀑布中间件),
+// 阻塞到低谷再自动继续 —— 不是 abort(不丢上下文/不加一次 LLM 请求), 等待期零 token。
+// 两条冻结的安全规则 (2026-09-14 用户拍板):
+//   ① 只在 step>=2 且本步 messages.length===0 时暂停: Inbox.claim() 是**持久化删除**, 用户消息
+//      要等 pre-step 决策后才 append ⇒ 在第一步/本步有待处理消息时暂停, 该消息在暂停期间只存在
+//      于内存, 任何重启 = 静默丢消息 (暂停可长达数小时, 风险不可接受)。
+//   ② fail-open: 闸门内任何异常(读模式/解析窗口/横幅/提问卡失败)一律立即 next() 放行并记 diag。
+// ================= host-compat 能力声明 (准入红线①; 契约 §3 冻结键集) =================
+// ⚠️ 只用 §3 词表内的 key —— agent/pre-step 与 userQuestions **不在词表内 ⇒ 不得新增 seam key**
+//    (未知 key 会被 probe 按"缺失"处置 ⇒ 面板假降级), 改用 note 与路径级 SKIPPED 如实标注。
+const REQUIRES = ["sessionEvents", "sessionAppend", "eventTypeRegistry", "rpcHandle", "commands", "tools", "agents"];
+const BLOCKED_FALLBACK = ["eventTypeRegistry", "agents"]; // 路径级阻断 (读 package.json 失败时的回退)
+const SEAM_OF = { sessionEvents: "readSessionEvents", sessionAppend: "appendNotice", eventTypeRegistry: "ensureEventTypes", rpcHandle: "rpcHandle" };
+let compatLogger = null; // 模块级日志出口 (writeShard 的降级告警用)
+/** 自身元信息 (版本 + 路径级阻断清单): 读自身 package.json, 失败回退内置常量并告警 */
+function ownMeta() {
+	try {
+		const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+		return { version: pkg?.version ?? "unknown", blocked: Array.isArray(pkg?.dshCompat?.blocked) ? pkg.dshCompat.blocked : null };
+	} catch { return { version: "unknown", blocked: null }; }
+}
+/** §4.10/RD-15: host-compat 不可用时插件自写状态分片 (扁平 8 键; 只写自己的分片; 0600) */
+function writeShard(ctx, entry) {
+	try {
+		const dir = `${process.env.DSH_COMPAT_DIR || "/data/dsh"}/compat-status.d`;
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(`${dir}/${entry.id}.json`, JSON.stringify({ schema: 1, ...entry, probedAt: new Date().toISOString() }, null, 2), { mode: 0o600 });
+	} catch (err) {
+		compatLogger?.warn?.(`dsh-taskqueue: 适配状态分片写入失败 (仅内存态): ${String(err?.message ?? err)}`);
+	}
+}
+
+const PAUSE_MIN_LEAD_MS = 5 * 60 * 1000;      // 距下一个低谷不足该时长 ⇒ 不暂停 (避免刚停就放行/白吃冷缓存)
+// v0.9.0 (调试态窗口注入): debug=peak 时合成的"模拟低谷边界"时长 —— 真实平峰时段也要能实测暂停
+//   (否则 debug=peak 只改时段判定、不改窗口计算 ⇒ nextOffpeakAt() 返回 now ⇒ min-lead 跳过, 平峰期等于半残)
+const DEBUG_OFFPEAK_LEAD_MS = 10 * 60 * 1000;
+const PAUSE_POLL_MS = 15000;                  // 共享轮询器周期 (只在有等待者时运行, 全部释放后停表)
+const PAUSE_SKIP_DIAG_TTL_MS = 5 * 60 * 1000; // 同会话同原因的 skip 诊断节流 (防刷屏)
+const PAUSE_ASK_ID = "offpeak-pause";
+// 提问卡选项 (顺序冻结): ① 本回合余下步骤放行 ② 保持暂停至低谷 ③ 持久豁免本会话
+const PAUSE_ASK_OPTIONS = ["继续到本回合结束", "保持暂停至低谷", "豁免本会话（持久，不再暂停/不再询问）"];
 
 // ---------- 容器重启检测 (v0.6.0) ----------
 // "重启后发送"时机: 任务在容器重启后**且处于低谷时段**的首个 tick 自动派发 (v0.8.5 遵循错峰:
@@ -146,15 +203,65 @@ async function fetchPeakWindows() {
 	}
 }
 
-/** 当前(北京时区)是否处于高峰时段 */
-function isBeijingPeak(windows, now = new Date()) {
-	const bj = new Date(now.getTime() + 8 * 3600 * 1000);
-	if (windows.weekdaysOnly) {
+/** 某一时刻(ms)是否高峰: 唯一口径实现 (isBeijingPeak / nextOffpeakAt 共用) */
+function isPeakAtMs(windows, ms) {
+	const def = windows ?? FALLBACK_WINDOWS;
+	const bj = new Date(ms + 8 * 3600 * 1000);
+	if (def.weekdaysOnly) {
 		const day = bj.getUTCDay(); // 0=周日
 		if (day === 0 || day === 6) return false;
 	}
 	const h = bj.getUTCHours();
-	return windows.windows.some(([s, e]) => h >= s && h < e);
+	return (def.windows ?? []).some(([s, e]) => h >= s && h < e);
+}
+
+/** 当前(北京时区)是否处于高峰时段 */
+function isBeijingPeak(windows, now = new Date()) {
+	return isPeakAtMs(windows, now.getTime());
+}
+
+/**
+ * v0.9.0 (高峰暂停闸门): 下一个"低谷时刻" —— 严格晚于 now 的第一个非高峰时刻。
+ * now 已是低谷 ⇒ 返回 now 本身。窗口边界都是整点, 故按整分钟推进即可精确落在边界上。
+ * ⚠️ 纯函数, **必须显式传参** (坑 19: 模块级 helper 不得引用 apply() 内闭包变量)。
+ * @returns {Date|null} null = 14 天内找不到低谷 (窗口定义异常/全时段高峰)
+ */
+export function nextOffpeakAt(windows, now = new Date()) {
+	const nowMs = now.getTime();
+	if (!isPeakAtMs(windows, nowMs)) return new Date(nowMs);
+	let t = Math.floor(nowMs / 60000) * 60000 + 60000; // 对齐到下一整分钟
+	const limit = nowMs + 14 * 24 * 3600 * 1000;        // 兜底上限 (正常最多跨一个周末)
+	while (t <= limit) {
+		if (!isPeakAtMs(windows, t)) return new Date(t);
+		t += 60000;
+	}
+	return null;
+}
+
+/**
+ * v0.9.0 (调试态窗口注入): "下一个低谷时刻"的**统一口径** (闸门 min-lead 判定 + 横幅 + /queue pause 文案共用)。
+ *   mode.debug === "peak" ⇒ 合成为 now + DEBUG_OFFPEAK_LEAD_MS 的"模拟低谷边界"(synthetic=true) ——
+ *     平峰期也能实测暂停; **真实窗口算法 nextOffpeakAt 本体不改**, 生产语义(auto/offpeak)一字不变。
+ *   否则与 `nextOffpeakAt(windows, now)` 完全等价 (synthetic=false)。
+ * ⚠️ 纯函数, 显式传参 (坑 19: 不得引用 apply() 闭包变量)。
+ * @returns {{ at: Date|null, synthetic: boolean }}
+ */
+export function effectiveNextOffpeak(mode, windows, now = new Date()) {
+	if (mode?.debug === "peak") return { at: new Date(now.getTime() + DEBUG_OFFPEAK_LEAD_MS), synthetic: true };
+	return { at: nextOffpeakAt(windows, now), synthetic: false };
+}
+
+/** 北京时区 "HH:MM" (横幅/命令文案用) */
+function beijingHm(d) {
+	return new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(11, 16);
+}
+
+/** 当前所在高峰窗口文案 ("14:00-18:00"; 不在窗口内 → "高峰") */
+function currentPeakWindowText(windows, now = new Date()) {
+	const h = new Date(now.getTime() + 8 * 3600 * 1000).getUTCHours();
+	const win = (windows?.windows ?? []).find(([s, e]) => h >= s && h < e);
+	const pad = (n) => String(n).padStart(2, "0");
+	return win ? `${pad(win[0])}:00-${pad(win[1])}:00` : "高峰";
 }
 
 function beijingNowString(now = new Date()) {
@@ -206,31 +313,42 @@ async function writeState(state) {
 	}
 }
 
-// ---------- 错峰出行模式状态 (v0.7.0 / v0.8.0 / v0.8.3) ----------
+// ---------- 错峰出行模式状态 (v0.7.0 / v0.8.0 / v0.8.3 / v0.9.0) ----------
 // 独立状态文件 (与队列任务状态分离, 设置项不随队列滚动):
-//   { enabled: boolean, exempt: { [sessionId]: true }, debug: "auto" | "peak" | "offpeak" }
-//   v0.8.0 新增 exempt: 单会话豁免 map —— 豁免会话高峰时段照常发送 (客户端拦截器放行)。
+//   { enabled: boolean, exempt: { [sessionId]: true }, debug: "auto" | "peak" | "offpeak", pause: boolean }
+//   v0.8.0 新增 exempt: 单会话豁免 map —— 豁免会话高峰时段照常发送 (客户端拦截器放行) + 不暂停。
 //   v0.8.3 新增 debug: 强制时段 (调试用) —— "peak" 强制当前为高峰、"offpeak" 强制平峰,
 //     "auto"(默认) = 按官方页判定。强制只影响"时段口径", 不区分客户端拦截与服务端派发:
 //     强制 peak → 消息入队且队列不派发; 强制 offpeak → 消息直发且到期任务立即派发。
+//   v0.9.0 新增 pause: 高峰暂停子开关 (默认 true) —— 高峰时把正在跑的回合停在步骤边界;
+//     关掉只是不自动暂停 (其余错峰功能不变); 主开关 enabled 关 ⇒ 本子开关一并失效。
+//     归一化: 非法值(非布尔/缺省) 一律回默认 true, 且**每次写盘都按归一化结果落盘**。
 async function readMode() {
 	try {
 		const m = JSON.parse(await readFile(MODE_FILE, "utf8"));
 		return {
 			enabled: m?.enabled === true,
 			exempt: (m?.exempt && typeof m.exempt === "object" && !Array.isArray(m.exempt)) ? m.exempt : {},
-			debug: normalizeDebug(m?.debug)
+			debug: normalizeDebug(m?.debug),
+			pause: m?.pause !== false
 		};
 	} catch {
-		return { enabled: false, exempt: {}, debug: "auto" };
+		return { enabled: false, exempt: {}, debug: "auto", pause: true };
 	}
 }
 
 async function writeMode(mode) {
 	try {
+		// 归一化后落盘 (读侧容错 + 写侧收敛, 两侧同口径)
+		const out = {
+			enabled: mode?.enabled === true,
+			exempt: (mode?.exempt && typeof mode.exempt === "object" && !Array.isArray(mode.exempt)) ? mode.exempt : {},
+			debug: normalizeDebug(mode?.debug),
+			pause: mode?.pause !== false
+		};
 		// 原子写 (tmp + rename): 与 taskqueue.json 同纪律, 避免写一半留下残缺 JSON
 		const tmp = `${MODE_FILE}.tmp`;
-		await writeFile(tmp, JSON.stringify(mode, null, 2), "utf8");
+		await writeFile(tmp, JSON.stringify(out, null, 2), "utf8");
 		await rename(tmp, MODE_FILE);
 		return true;
 	} catch {
@@ -257,15 +375,22 @@ function peakSourceText(mode, windowSource) {
 	if (mode?.debug === "offpeak") return `强制平峰(debug)`;
 	return windowSource;
 }
-/** mode.get / mode.set / mode.exempt / mode.debug 的统一返回体 */
-function modeValue(mode, windows, windowSource) {
+/**
+ * mode.get / mode.set / mode.pause / mode.exempt / mode.debug 的统一返回体。
+ * ⚠️ paused 由调用方显式传入 (坑 19: 等待者表在 apply() 闭包内, 模块级 helper 不得引用)。
+ */
+function modeValue(mode, windows, windowSource, paused, pauseInstalled) {
 	return {
 		enabled: mode.enabled,
 		peak: effectivePeak(mode, windows),
 		windowSource,
 		peakSource: peakSourceText(mode, windowSource),
 		debug: mode.debug,
-		exempt: mode.exempt
+		exempt: mode.exempt,
+		pause: mode.pause !== false,
+		paused: (paused && typeof paused === "object") ? paused : { count: 0, sessions: [] },
+		// v0.9.0 可见性: 暂停闸门自检结果 (false = 本版本宿主不兼容, 暂停路径已停用)
+		pauseInstalled: pauseInstalled !== false
 	};
 }
 
@@ -369,6 +494,59 @@ export async function apply(ctx, config) {
 		if (Date.now() - lastWindowFetch > WINDOW_CACHE_TTL_MS) await refreshWindows();
 		return windows;
 	}
+
+	// ================= host-compat 适配闸门 (准入红线①②) =================
+	// 加载强制: **动态 import + try/catch** (禁静态 import —— 缺包会导致模块加载失败/崩溃循环);
+	// 禁 legacy 直连兜底双路径 (缺能力即停用 + 上报, 见契约 §10.1/§10.2/D12)。
+	const PLUGIN_ID = name;
+	compatLogger = ctx.logger;
+	const { version: PLUGIN_VERSION, blocked: pkgBlocked } = ownMeta();
+	const BLOCKING = (Array.isArray(pkgBlocked) ? pkgBlocked : BLOCKED_FALLBACK).filter((k) => REQUIRES.includes(k));
+	if (!Array.isArray(pkgBlocked)) ctx.logger?.warn?.(`${PLUGIN_ID}: dshCompat.blocked 读取失败 → 回退内置清单 [${BLOCKING.join(", ")}]`);
+	let seams = null, compat = null;
+	try { seams = await import("@ericality/dsh-host-compat/seams"); }
+	catch (err) { ctx.logger?.warn?.(`dsh-taskqueue: host-compat/seams 不可用 → 会话日志读取/横幅注入/RPC 面板按路径降级 (${String(err?.message ?? err)})`); }
+	try { compat = await import("@ericality/dsh-host-compat"); } catch { compat = null; }
+	const seamFn = (key) => (typeof seams?.[SEAM_OF[key]] === "function" ? seams[SEAM_OF[key]] : null);
+	const localMissing = () => REQUIRES.filter((k) => {
+		switch (k) {
+		case "commands": return typeof ctx.commands?.register !== "function";
+		case "tools": return typeof ctx.tools?.register !== "function";
+		case "agents": return !ctx.agents || typeof ctx.agents.get !== "function" || typeof ctx.agents.list !== "function" || typeof ctx.agents.resume !== "function";
+		default: return typeof seamFn(k) !== "function";
+		}
+	});
+	let capMissing = localMissing();
+	let capBlockedProbe = null, capStateProbe = null;
+	const prober = typeof compat?.probe === "function" ? compat : (typeof seams?.probe === "function" ? seams : null);
+	if (prober) {
+		try {
+			const r = prober.probe(REQUIRES, PLUGIN_ID, PLUGIN_VERSION, ctx, BLOCKING);
+			if (Array.isArray(r?.blocked)) capBlockedProbe = r.blocked.filter((k) => REQUIRES.includes(k));
+			if (typeof r?.state === "string") capStateProbe = r.state;
+			if (Array.isArray(r?.missing)) capMissing = [...new Set([...r.missing.filter((k) => REQUIRES.includes(k)), ...localMissing()])];
+		} catch (err) { ctx.logger?.warn?.(`dsh-taskqueue: probe() 失败 → 退回本地探测 (${String(err?.message ?? err)})`); }
+	}
+	const capBlocked = capBlockedProbe ?? capMissing.filter((k) => BLOCKING.includes(k));
+	const capState = capStateProbe ?? (capBlocked.length ? "BLOCKED" : (capMissing.length ? "DEGRADED" : "OK"));
+	const capNote = capState === "OK" ? "" : "缺 agents ⇒ 自动派发/恢复/撤回停用(既有 fail-safe) · 缺 eventTypeRegistry ⇒ 队列横幅停用(写未注册类型会让会话无法加载) · 缺 sessionEvents ⇒ blank 判定退化为 seq===0 快路径+标题去重退化 · 缺 sessionAppend ⇒ 横幅不注入(派发照常) · 缺 rpcHandle ⇒ /queue 面板停用(命令/工具仍可) · 缺 commands/tools ⇒ 对应入口停用";
+	const finalNote = capBlocked.length ? `${capNote}${capNote ? " ｜ " : ""}路径级阻断(仅停该能力对应路径): ${capBlocked.join(", ")}` : capNote;
+	if (capState !== "OK") ctx.logger?.warn?.(`dsh-taskqueue: 适配状态 ${capState} — 缺能力 [${capMissing.join(", ")}] 阻断 [${capBlocked.join(", ")}]; ${finalNote}`);
+	const capEntry = { id: PLUGIN_ID, version: PLUGIN_VERSION, state: capState, missing: capMissing, blocked: capBlocked, note: finalNote };
+	const reporter = typeof compat?.report === "function" ? compat : (typeof seams?.report === "function" ? seams : null);
+	if (reporter) { try { reporter.report(capEntry); } catch { writeShard(ctx, capEntry); } } else writeShard(ctx, capEntry);
+	/** 准入红线②: 追加/降级上报 (state **只降不升**; note 追加) —— 禁止"报 OK 而功能坏" */
+	const compatReport = (extraNote, forceState) => {
+		if (!extraNote && !forceState) return;
+		const entry = {
+			...capEntry,
+			state: capState === "OK" ? (forceState ?? "DEGRADED") : capState,
+			note: `${finalNote}${finalNote ? " ｜ " : ""}${extraNote ?? ""}`
+		};
+		try { if (reporter) reporter.report(entry); else writeShard(ctx, entry); }
+		catch { try { writeShard(ctx, entry); } catch { /* 上报失败不影响主流程 */ } }
+	};
+	const capOk = (key) => !capMissing.includes(key) && !capBlocked.includes(key); // 阻断 key 同按"该路径停用"处理
 
 	// ---------- 无 token 横幅反馈 (v0.3.0) ----------
 	// 自定义会话事件 notice/banner: 非 surface 事件, 不进入模型历史、不消耗 token,
@@ -666,6 +844,10 @@ export async function apply(ctx, config) {
 	let tickFailStreak = 0;              // tick 全局连续异常计数 (某轮零异常即清零)
 	const dispatchedMsgIds = new Map();  // messageId -> taskId (claim 事件快速过滤, 避免无关消息写盘)
 	const claimedMsgIds = new Set();     // 已被 claim 成会话内 user/message 的 messageId (0.1.2 事件观察者维护)
+	// v0.8.6 (2026-09-14, 用户拍板): 丢弃来源分类 —— 重启把 inbox 冲掉 必须与 人工删队 分开标识。
+	//   sessionBootIds: sessionId -> 最近观察到的容器启动标识
+	//   判定: 派发时记下的 task.dispatchedBootId ≠ 当前 boot ⇒ 消息跨越了一次容器重启 ⇒ dropCause="restart"
+	const sessionBootIds = new Map();
 	const titledSessions = new Set();    // 本插件已设过标题的会话 (替代不可用的 session.events 判定)
 
 	/** 能力门闩: boot 时静态探测宿主能力, 缺失即停用自动路径 (宁停勿发) */
@@ -704,15 +886,16 @@ export async function apply(ctx, config) {
 		return true;
 	}
 
-	/** 熔断/失败告警: 日志 warn + (会话在线时)队列横幅; 绝不重发 */
-	function alertTask(task, text) {
+	/** 熔断/失败/取消告警: 日志 warn + (会话在线时)队列横幅; 绝不重发。
+	 *  v0.8.6: 可传 opts.title 覆盖横幅标题 (取消类告警不该写"已熔断")。 */
+	function alertTask(task, text, opts = {}) {
 		ctx.logger?.warn?.(`dsh-taskqueue: ${text}`);
 		try {
 			const agent = task.sessionId ? ctx.agents.get?.(task.sessionId) : null;
 			if (agent?.session) {
 				appendQueueBanner(agent.session, {
 					state: "warn",
-					title: `任务 #${task.id} 已熔断`,
+					title: opts.title ?? `任务 #${task.id} 已熔断`,
 					lines: [text, `内容: ${oneLine(task.content).slice(0, 120)}`]
 				});
 			}
@@ -750,6 +933,7 @@ export async function apply(ctx, config) {
 		task.requeuedAt = new Date().toISOString();
 		task.requeuedBy = "manual-force";
 		delete task.dispatchedAt;
+		delete task.dispatchedBootId; // v0.8.6: 重新排队 ⇒ 丢弃分类基线一并清掉
 		delete task.messageId;
 		task.roundId = null;
 		task.dispatchCount = 0;
@@ -782,15 +966,32 @@ export async function apply(ctx, config) {
 		try {
 			const msgId = payload?.message?.id;
 			if (!msgId || !dispatchedMsgIds.has(msgId)) return;
-			const failed = [];
+			// v0.8.6 (2026-09-14 用户实测: "我在 GUI 队列里手动删除, 却被记成熔断"): 消息被移出 inbox
+			// 有两种来源, 都必须记 cancelled(人工终态) 而非 failed(故障), 但**标识要分开**(用户拍板):
+			//   · dropCause="restart"  ← task.dispatchedBootId ≠ 当前 boot ⇒ 消息跨了一次容器重启 (重启把 inbox 冲掉)
+			//   · dropCause="removed"  ← 同一次启动内被丢弃 ⇒ 人工删队 / 主动移除
+			// 宿主语义背书 (dsh-agent/lib/types/inbox.js): discard 恒带 outcome:"canceled"(
+			// "work dropped unrun" = 工作被丢弃未执行), 与 turn 正常 claim 走的 splice 明确区分。
+			const bootNow = readBootId();
+			const dropped = [];
 			await mutateState((state) => {
 				for (const t of state.tasks) {
 					if (t.status !== "dispatched" || t.messageId !== msgId) continue;
-					if (setTerminal(t, "failed", { failReason: "派发消息被 inbox 丢弃, 从未执行" })) failed.push(t);
+					const cause = dropCauseOf(t, bootNow, sessionBootIds.get(t.sessionId));
+					const extra = cause === "restart"
+						? { dropCause: "restart", failReason: "容器重启清空 inbox, 派发消息未执行 (不重发)" }
+						: { dropCause: "removed", failReason: "派发消息已被移出队列 (人工删除/主动移除), 未执行" };
+					if (setTerminal(t, "cancelled", extra)) dropped.push({ task: t, cause });
+					sessionBootIds.delete(t.sessionId);
 				}
-				return failed.length;
+				return dropped.length;
 			});
-			for (const t of failed) alertTask(t, `任务 #${t.id} 派发消息被 inbox 丢弃(从未执行) → failed (不重发)`);
+			for (const { task, cause } of dropped) {
+				const text = cause === "restart"
+					? `任务 #${task.id} 因容器重启清空 inbox 而未执行 → 已取消(重启丢弃, 不重发; 需执行请 /queue run-now ${task.id} --force)`
+					: `任务 #${task.id} 的派发消息已被移出队列 → 已取消(人工删除, 未执行; 需执行请 /queue run-now ${task.id} --force)`;
+				alertTask(task, text, { title: cause === "restart" ? `任务 #${task.id} 已取消(重启丢弃)` : `任务 #${task.id} 已取消(人工删除)` });
+			}
 		} catch (err) {
 			ctx.logger?.warn?.(`dsh-taskqueue: discarded 处理失败(忽略, 不重发): ${String(err?.message ?? err)}`);
 		}
@@ -799,8 +1000,14 @@ export async function apply(ctx, config) {
 	// 订阅 claim/discarded (全局钩子: cordis dispatch 对 global 不做作用域过滤, 与 reconcile 同法)
 	// 2026-09-10 (0.1.2 适配): agent.session.events 不再可用 → 用 session/event 观察者
 	// 自行跟踪"派发消息已被 claim 成会话内 user/message"(只记我们关心的 messageId, 内存有界)
-	ctx.on("session/event", (_session, event) => {
+	ctx.on("session/event", (session, event) => {
 		try {
+			const sid = session?.id ? String(session.id) : null;
+			// v0.8.6: 记录"本会话被观察到的容器启动标识" —— 丢弃分类的第二个判据
+			if (sid) {
+				const b = readBootId();
+				if (b && sessionBootIds.get(sid) !== b) sessionBootIds.set(sid, b);
+			}
 			const id = event?.data?.id;
 			if (event?.type === "user/message" && id && dispatchedMsgIds.has(id)) claimedMsgIds.add(id);
 		} catch { /* 忽略 */ }
@@ -859,6 +1066,7 @@ export async function apply(ctx, config) {
 		task.dispatchedBy = force ? "manual-force" : "auto";
 		task.status = "dispatched";
 		task.dispatchedAt = new Date().toISOString();
+		task.dispatchedBootId = readBootId(); // v0.8.6: 派发时的容器启动标识 (丢弃来源分类)
 		// ⚠️ 不要在此重置 failCount: 它是"连续失败"熔断计数, 只有 claim/done 才清零;
 		//    否则投递失败会被每轮重置, 熔断永远不触发 (2026-09-10 harness 实测踩到)。
 		task.unconfirmedCount = 0;
@@ -877,6 +1085,7 @@ export async function apply(ctx, config) {
 			dispatchedMsgIds.delete(task.messageId);
 			delete task.messageId;
 			delete task.dispatchedAt;
+			delete task.dispatchedBootId; // v0.8.6: 派发失败回滚 ⇒ 分类基线清掉
 			task.status = "pending";
 			await writeState(state);
 			throw err;
@@ -1108,6 +1317,260 @@ export async function apply(ctx, config) {
 	setTimeout(() => { void tick().catch(() => {}); }, 3000);
 	ctx.effect(() => () => clearInterval(timer));
 
+	// ================= v0.9.0: 高峰暂停闸门 =================
+	// 挂点: `ctx.on("agent/pre-step", async (payload, next) => …)` —— 每一步开始前的**瀑布中间件**。
+	//   在 next() 之前 await ⇒ 本步的模型调用与工具照常跑完, **下一步的 LLM 请求被挡住** ⇒
+	//   回合停在"当前步骤结束后", 等待期零 token。`next()` 必须**恰好调用一次**。
+	// 释放(任一即立即恢复执行): 低谷到达 / enabled=false / pause=false / 本会话被豁免 /
+	//   提问卡答①(本回合余下步骤放行) / signal.aborted(用户点停止)。
+	const pauseWaiters = new Map();    // sessionId -> waiter (等待中的回合; 也是 mode.get 的 paused 摘要来源)
+	const pauseAsked = new Map();      // sessionId -> 已弹过提问卡的高峰窗口 key (每会话每高峰窗口最多一次)
+	const pauseTurnAllow = new Set();  // `${sessionId}:${turn}` 提问卡答① ⇒ 本回合余下步骤放行
+	const pauseSkipDiagAt = new Map(); // `${sessionId}:${reason}` -> 上次 skip 诊断时刻 (节流, 防刷屏)
+	let pauseTimer = null;             // 共享轮询器 (只在有等待者时运行)
+	let pauseGateReason = null;        // 非空 = 闸门自检失败, 暂停路径停用 (其余功能照旧)
+
+	function windowKey(windows, now = new Date()) {
+		return `${new Date(now.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10)} ${currentPeakWindowText(windows, now)}`;
+	}
+
+	/** mode.get 的 paused 摘要: { count, sessions:[{sessionId, since, turn, step, nextOffpeakAt}] } */
+	function pauseSummary() {
+		const sessions = [];
+		for (const w of pauseWaiters.values()) {
+			if (w.released) continue;
+			sessions.push({ sessionId: w.sessionId, since: w.since, turn: w.turn, step: w.step, nextOffpeakAt: w.nextOffpeakAt, syntheticNext: w.synthetic === true });
+		}
+		return { count: sessions.length, sessions };
+	}
+
+	/** skip 诊断: 同会话同原因 5 分钟内只记一条 (闸门每步都会评估, 不节流会刷屏) */
+	function diagSkip(sessionId, reason) {
+		const key = `${sessionId ?? "-"}:${reason}`;
+		const now = Date.now();
+		if (now - (pauseSkipDiagAt.get(key) ?? 0) < PAUSE_SKIP_DIAG_TTL_MS) return;
+		pauseSkipDiagAt.set(key, now);
+		void appendDiag({ event: "pause.skip", reason, sessionId: shortSession(sessionId) });
+	}
+
+	function stopPauseTimerIfIdle() {
+		if (pauseTimer && pauseWaiters.size === 0) { clearInterval(pauseTimer); pauseTimer = null; }
+	}
+
+	function ensurePauseTimer() {
+		if (pauseTimer || pauseGateReason) return;
+		pauseTimer = setInterval(() => { void checkPauseWaiters(); }, PAUSE_POLL_MS);
+		pauseTimer.unref?.();
+	}
+
+	/** 释放一个等待者 (幂等): 恢复回合 + 恢复横幅 + diag; 任何可见性失败都不影响释放本身 */
+	function releaseWaiter(w, reason) {
+		if (!w || w.released) return;
+		w.released = true;
+		w.releasedReason = reason;
+		pauseWaiters.delete(w.sessionId);
+		try { if (w.abortHandler && typeof w.signal?.removeEventListener === "function") w.signal.removeEventListener("abort", w.abortHandler); } catch { /* 忽略 */ }
+		try {
+			appendQueueBanner(w.session, {
+				title: "▶ 已恢复执行（低谷）",
+				lines: [`第 ${w.step} 步后继续 · 释放原因: ${reason}`]
+			});
+		} catch { /* 横幅失败不影响恢复 */ }
+		void appendDiag({ event: "pause.release", reason, sessionId: shortSession(w.sessionId), step: w.step, waitedSec: Math.max(0, Math.round((Date.now() - Date.parse(w.since)) / 1000)) });
+		stopPauseTimerIfIdle();
+		try { w.resolve(); } catch { /* 忽略 */ }
+	}
+
+	function releaseAllForReason(reason) {
+		for (const w of [...pauseWaiters.values()]) releaseWaiter(w, reason);
+	}
+
+	/** 共享轮询器: 一轮读完模式/窗口, 再逐个判定释放 (单会话异常不影响其他等待者) */
+	async function checkPauseWaiters() {
+		if (pauseWaiters.size === 0) { stopPauseTimerIfIdle(); return; }
+		let mode = null, ws = null, err = null;
+		try { mode = await readMode(); ws = await resolveWindows(); } catch (e) { err = e; }
+		const now = new Date();
+		for (const w of [...pauseWaiters.values()]) {
+			try {
+				if (w.signal?.aborted) { releaseWaiter(w, "abort"); continue; }
+				// 规则②: 读不到模式 = 异常 ⇒ 立即放行 (绝不无限阻塞)
+				if (err || !mode) { releaseWaiter(w, "error"); continue; }
+				if (mode.enabled !== true) { releaseWaiter(w, "mode-off"); continue; }
+				if (mode.pause === false) { releaseWaiter(w, "pause-off"); continue; }
+				if (w.sessionId && mode.exempt?.[w.sessionId]) { releaseWaiter(w, "exempt"); continue; }
+				if (!effectivePeak(mode, ws, now)) { releaseWaiter(w, "offpeak"); continue; }
+			} catch { /* 单个等待者判定异常: 保持暂停, 下轮再判 */ }
+		}
+	}
+
+	/** 豁免开关 (RPC mode.exempt 与提问卡③ 共用): 写 offpeak-mode.json 的 exempt map */
+	async function setExemptMap(sessionId, exempt) {
+		const cur = await readMode();
+		const exemptMap = { ...cur.exempt };
+		if (exempt) exemptMap[sessionId] = true;
+		else delete exemptMap[sessionId];
+		await writeMode({ enabled: cur.enabled, exempt: exemptMap, debug: cur.debug, pause: cur.pause });
+		return exemptMap;
+	}
+
+	/**
+	 * 提问卡 (每会话每高峰窗口最多一次): ① 继续到本回合结束 ② 保持暂停至低谷 ③ 豁免本会话。
+	 * 无人应答/解析失败/异常(含子 agent 的 DELEGATED_CALLER) ⇒ **保持暂停** (静默, 不抛)。
+	 */
+	function askPauseChoice(w) {
+		let uq = null;
+		try { uq = ctx.get?.("userQuestions"); } catch { uq = null; }
+		if (!uq || typeof uq.ask !== "function") {
+			void appendDiag({ event: "pause.ask", reason: "no-service", sessionId: shortSession(w.sessionId) });
+			return;
+		}
+		Promise.resolve()
+			.then(() => uq.ask({
+				questions: [{
+					id: PAUSE_ASK_ID,
+					header: "高峰暂停",
+					question: `已进入高峰（${w.windowText}），本会话已暂停在第 ${w.step} 步后。是否继续？`,
+					detail: `低谷时段预计 ${beijingHm(new Date(w.nextOffpeakAt))} 到达；不回答 = 保持暂停至低谷（等待期零 token）。`,
+					options: PAUSE_ASK_OPTIONS.map((label) => ({ label }))
+				}],
+				agent: w.agent,
+				signal: w.signal
+			}))
+			.then((res) => {
+				const answers = Array.isArray(res?.answers) ? res.answers : [];
+				const ans = answers.find((a) => a?.id === PAUSE_ASK_ID) ?? answers[0] ?? null;
+				const selected = Array.isArray(ans?.selected) ? ans.selected : [];
+				const idx = selected.map((s) => PAUSE_ASK_OPTIONS.indexOf(s)).find((i) => i >= 0);
+				if (idx === 0) {
+					pauseTurnAllow.add(`${w.sessionId}:${w.turn}`);
+					void appendDiag({ event: "pause.ask", reason: "allow-turn", sessionId: shortSession(w.sessionId) });
+					releaseWaiter(w, "ask-allow-turn");
+					return;
+				}
+				if (idx === 2) {
+					void appendDiag({ event: "pause.ask", reason: "exempt", sessionId: shortSession(w.sessionId) });
+					void setExemptMap(w.sessionId, true)
+						.then(() => releaseWaiter(w, "ask-exempt"))
+						.catch(() => releaseWaiter(w, "ask-exempt")); // 写盘失败也放行 (不阻塞回合)
+					return;
+				}
+				// ② 保持暂停至低谷 / 未识别答案 ⇒ 保持暂停
+				void appendDiag({ event: "pause.ask", reason: idx === 1 ? "stay" : "unparsed", sessionId: shortSession(w.sessionId) });
+			})
+			.catch((err) => {
+				const msg = String(err?.message ?? err);
+				void appendDiag({ event: "pause.ask", reason: /DELEGATED_CALLER/.test(msg) ? "delegated" : "error", error: msg, sessionId: shortSession(w.sessionId) });
+			});
+	}
+
+	/** 进入暂停: 登记等待者 + 横幅 + diag + 提问卡 + abort 监听; 返回的 promise 在释放时 resolve */
+	async function waitForPause(info) {
+		const sessionId = info.sessionId ?? `agent:${randomUUID()}`;
+		const previous = pauseWaiters.get(sessionId);
+		if (previous) releaseWaiter(previous, "replaced"); // 同会话重复进入(理论不会) ⇒ 先放行旧的, 防悬挂
+		const w = {
+			sessionId,
+			agent: info.agent,
+			session: info.session,
+			step: info.step,
+			turn: info.turn,
+			signal: info.signal,
+			since: new Date().toISOString(),
+			nextOffpeakAt: info.nextAt.toISOString(),
+			windowText: currentPeakWindowText(info.windowsNow),
+			synthetic: info.synthetic === true,
+			released: false,
+			resolve: null,
+			abortHandler: null
+		};
+		const promise = new Promise((resolve) => { w.resolve = resolve; });
+		pauseWaiters.set(sessionId, w);
+		ensurePauseTimer();
+		// 状态下发: 进入暂停 (复用既有队列横幅; 可见性失败绝不影响暂停本身)
+		try {
+			appendQueueBanner(info.session, {
+				state: "warn",
+				title: `⏸ 已暂停 · 高峰窗口 ${w.windowText} · 预计 ${beijingHm(info.nextAt)} 继续（第 ${w.step} 步后）${w.synthetic ? "（debug 模拟低谷边界）" : ""}`,
+				lines: ["等待期零 token（下一步的 LLM 请求已挡住）", "立即继续: 提问卡选「继续到本回合结束」, 或 /queue pause off; 查看: /queue pause"]
+			});
+		} catch { /* 横幅失败不影响暂停 */ }
+		void appendDiag({ event: "pause.enter", sessionId: shortSession(sessionId), step: w.step, turn: w.turn, nextOffpeakAt: w.nextOffpeakAt, window: w.windowText, syntheticNext: w.synthetic });
+		// 提问卡: 每会话每高峰窗口最多一次
+		const key = `${sessionId}:${windowKey(info.windowsNow)}`;
+		if (!pauseAsked.has(key)) { pauseAsked.set(key, Date.now()); askPauseChoice(w); }
+		// abort (用户点停止) 立即释放; 轮询器只作兜底
+		try {
+			if (info.signal && typeof info.signal.addEventListener === "function") {
+				w.abortHandler = () => releaseWaiter(w, "abort");
+				info.signal.addEventListener("abort", w.abortHandler);
+				if (info.signal.aborted) releaseWaiter(w, "abort");
+			}
+		} catch { /* 无 signal 能力 ⇒ 靠轮询 */ }
+		await promise;
+	}
+
+	/**
+	 * 闸门评估 (返回即"可以放行"): 触发条件见文首冻结契约。
+	 * 任一条件不满足 ⇒ 记 skip diag 并立即返回 (调用方随即 next())。
+	 */
+	async function pauseGate(payload) {
+		const sessionId = payload?.agent?.session?.id ? String(payload.agent.session.id) : null;
+		const step = Number(payload?.step) || 1;
+		const turn = Number(payload?.turn) || 0;
+		const messages = payload?.messages;
+		const mode = await readMode();
+		const windowsNow = await resolveWindows();
+		if (mode.enabled !== true) return diagSkip(sessionId, "mode-off");
+		if (mode.pause === false) return diagSkip(sessionId, "pause-off");
+		if (sessionId && mode.exempt?.[sessionId]) return diagSkip(sessionId, "exempt");
+		if (!effectivePeak(mode, windowsNow)) return diagSkip(sessionId, "offpeak");
+		if (sessionId && pauseTurnAllow.has(`${sessionId}:${turn}`)) return diagSkip(sessionId, "turn-allowed");
+		if (step < 2) return diagSkip(sessionId, "step1");                                  // 规则①: 第一步永不拦
+		if (!Array.isArray(messages) || messages.length !== 0) return diagSkip(sessionId, "has-messages"); // 规则①: 本步有消息不拦
+		const now = new Date();
+		// debug=peak 时合成"模拟低谷边界"(见 effectiveNextOffpeak); 其余情形与 nextOffpeakAt 完全等价
+		const { at: nextAt, synthetic } = effectiveNextOffpeak(mode, windowsNow, now);
+		// 距低谷不足 PAUSE_MIN_LEAD_MS (含"14 天内无低谷") ⇒ 不暂停
+		if (!nextAt || nextAt.getTime() - now.getTime() < PAUSE_MIN_LEAD_MS) return diagSkip(sessionId, "min-lead");
+		await waitForPause({ sessionId, agent: payload?.agent ?? null, session: payload?.agent?.session ?? null, step, turn, signal: payload?.signal, nextAt, synthetic, windowsNow });
+	}
+
+	/** RPC 统一返回体: 注入闸门自检结果 (坑 19: 闭包变量必须显式传参, 不用模块级 helper 读闭包) */
+	const modeOut = (mode, windows) => modeValue(mode, windows, windowSource, pauseSummary(), pauseGateReason === null);
+
+	// 安装自检 (路径级降级): pre-step 订不上 ⇒ **只停用"高峰暂停"这一条路径**, 其余功能照旧。
+	try {
+		if (typeof ctx.on !== "function") throw new Error("ctx.on 不可用");
+		// ⚠️ 必须带 { global: true }: cordis dispatch 对非 global 订阅做**作用域过滤** ⇒ 本插件作用域外的
+		// agent(pre-step 属于 agent 自己的作用域) 事件根本不会到达本 handler —— 表现为"闸门装上了但从不触发"
+		// (VM 真机实测: turn 跑完也无任何 pause.* diag)。本插件既有观察者(session/event、inbox/claimed)同法。
+		ctx.on("agent/pre-step", async (payload, next) => {
+			try {
+				if (!pauseGateReason) await pauseGate(payload);
+			} catch (err) {
+				// 规则② fail-open: 闸门内任何异常立即放行 (绝不阻塞、绝不吞消息)
+				void appendDiag({ event: "pause.skip", reason: "error", error: String(err?.message ?? err) });
+			}
+			return next(); // ⚠️ next() 恰好调用一次 (暂停/放行两条路径都走这里)
+		}, { global: true });
+		ctx.effect(() => () => { if (pauseTimer) { clearInterval(pauseTimer); pauseTimer = null; } });
+	} catch (err) {
+		pauseGateReason = String(err?.message ?? err);
+		void appendDiag({ event: "pause.install-failed", reason: pauseGateReason });
+		ctx.logger?.warn?.(`dsh-taskqueue: [fail-safe] 高峰暂停闸门未安装 — ${pauseGateReason} (仅暂停路径停用; 入队/派发/豁免等其余功能照旧)`);
+	}
+	// 准入红线② (路径级 SKIPPED, 如实标注): 暂停闸门/提问卡/横幅的降级必须写进适配状态 note ——
+	//   否则面板显示 OK 而"高峰暂停"这条路径其实是坏的 (= 禁止的"报 OK 而功能坏")。
+	try {
+		const uqOk = (() => { try { return typeof ctx.get?.("userQuestions")?.ask === "function"; } catch { return false; } })();
+		const extra = [];
+		if (pauseGateReason) extra.push(`高峰暂停: 未安装(${pauseGateReason})`);
+		if (!uqOk) extra.push("提问卡降级为自动暂停");
+		if (capBlocked.includes("eventTypeRegistry")) extra.push("无横幅但暂停仍生效");
+		if (extra.length) compatReport(extra.join(" · "), "DEGRADED");
+	} catch { /* 上报失败不影响功能 */ }
+
 	// ---------- 命令 ----------
 	ctx.commands.register({
 		name: "queue",
@@ -1243,8 +1706,9 @@ export async function apply(ctx, config) {
 				if (!DEBUG_VALUES.includes(arg)) {
 					return { kind: "error", text: `用法: /queue debug peak | offpeak | auto (当前: ${cur.debug})` };
 				}
-				await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug: arg });
+				await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug: arg, pause: cur.pause });
 				await appendDiag({ event: "mode.debug", debug: arg, via: "slash" });
+				if (arg === "offpeak") releaseAllForReason("offpeak"); // 强制平峰 ⇒ 等待中的回合立即恢复
 				const windowsNow = await resolveWindows();
 				const peak = effectivePeak({ ...cur, debug: arg }, windowsNow);
 				const label = arg === "peak" ? "强制高峰" : arg === "offpeak" ? "强制平峰" : "自动(官方页判定)";
@@ -1254,6 +1718,38 @@ export async function apply(ctx, config) {
 						arg === "offpeak" ? "→ 客户端: 消息正常直发; 服务端: 到期任务立即派发" :
 							`→ 恢复官方页判定: 当前${peak ? "高峰" : "平峰"} (${windowSource})`,
 					"恢复: /queue debug auto"
+				].join("\n") };
+			}
+			// v0.9.0 高峰暂停 (子开关): 高峰时把**正在跑的回合**停在当前步骤结束后, 阻塞到低谷自动继续
+			//   (不是 abort, 等待期零 token)。无参 = 查看暂停中的会话/开始时刻/恢复时刻/下一低谷。
+			case "pause": {
+				const arg = rest.trim().toLowerCase();
+				if (arg === "on" || arg === "off") {
+					const cur = await readMode();
+					const pause = arg === "on";
+					await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug: cur.debug, pause });
+					await appendDiag({ event: pause ? "pause.switch-on" : "pause.switch-off", via: "slash" });
+					if (!pause) releaseAllForReason("pause-off");
+					return { kind: "success", text: [
+						`高峰暂停(全局)已${pause ? "开启" : "关闭"} (offpeak-mode.json 的 pause=${pause})`,
+						pause ? "高峰时段正在跑的回合会停在步骤边界, 到低谷自动继续" : "等待中的回合已立即恢复执行; 其余错峰功能不变",
+						cur.enabled ? "" : "⚠ 错峰出行模式(enabled)当前是关闭的 ⇒ 本子开关暂不生效"
+					].filter(Boolean).join("\n") };
+				}
+				if (arg && arg !== "status") return { kind: "error", text: `用法: /queue pause [on|off|status] (当前: ${arg})` };
+				const mode = await readMode();
+				const ws = await resolveWindows();
+				const sum = pauseSummary();
+				const nx = effectiveNextOffpeak(mode, ws);
+				const nextAt = nx.at;
+				return { kind: "success", text: [
+					`暂停闸门: ${pauseGateReason === null ? "已安装" : `未安装(${pauseGateReason})`}`,
+					`高峰暂停(全局): ${mode.pause === false ? "关" : "开"}${mode.enabled ? "" : " (错峰出行模式未开启 ⇒ 不生效)"}`,
+					`当前时段: ${effectivePeak(mode, ws) ? "高峰" : "平峰"} (${peakSourceText(mode, windowSource)}) · 高峰窗口 ${(ws?.windows ?? []).map(([s, e]) => `${String(s).padStart(2, "0")}:00-${String(e).padStart(2, "0")}:00`).join(" ")}`,
+					`暂停中的回合: ${sum.count} 个`,
+					...sum.sessions.map((s) => `  · ${shortSession(s.sessionId)}: 自 ${beijingHm(new Date(s.since))} 起暂停 (第 ${s.step} 步后) · 预计 ${beijingHm(new Date(s.nextOffpeakAt))} 恢复`),
+					`下一个低谷: ${nextAt ? beijingHm(nextAt) : "—"}${nx.synthetic ? "（debug 模拟低谷边界）" : ""} (距不足 5 分钟则不暂停)`,
+					"用法: /queue pause on | off | status"
 				].join("\n") };
 			}
 			case "help": case "":
@@ -1268,6 +1764,7 @@ export async function apply(ctx, config) {
 					"/queue run-now <id>                 立即派发(不等低谷)",
 					"/queue target [会话id]              查看/设置兜底派发目标会话",
 					"/queue debug peak|offpeak|auto      强制当前时段 (调试: 平峰期实测错峰功能)",
+					"/queue pause [on|off|status]        高峰暂停: 高峰期把正在跑的回合停在步骤边界, 到低谷自动继续 (默认开)",
 					"/queue help                         本帮助",
 					"低谷时段由官方页动态解析(当前: 周一至周五 9-12/14-18 高峰, 其余低谷)"
 				].join("\n") };
@@ -1465,6 +1962,7 @@ export async function apply(ctx, config) {
 					status: t.status,
 					statusText: STATUS_TEXT[t.status] ?? t.status,
 					queuedSending: isQueuedSending(t), // v0.5.0: 已派发且消息仍在收件箱排队 (可撤回)
+					dropCause: t.dropCause ?? null, // v0.8.6: cancelled 的来源 "restart"(重启丢弃) / "removed"(人工删除)
 					createdAt: t.createdAt,
 					scheduledAt: t.scheduledAt ?? null,
 					trigger: t.trigger ?? null, // v0.6.0: "restart" = 容器重启后派发
@@ -1549,9 +2047,11 @@ export async function apply(ctx, config) {
 				});
 			}
 			// ── v0.7.0 错峰出行模式 ────────────────────────────────────────────
-			// mode.get    → { enabled, peak, windowSource, peakSource, debug, exempt } 开关 + 实时时段 + 豁免 map
-			// mode.set    { enabled }                               持久化开关 (写 MODE_FILE, 保留 exempt/debug)
-			// mode.exempt { sessionId, exempt } (v0.8.0)            单会话豁免切换 (高峰照常发送)
+			// mode.get    → { enabled, peak, windowSource, peakSource, debug, exempt,
+			//                 pause, paused }                      开关 + 实时时段 + 豁免 map + **v0.9.0 高峰暂停**
+			// mode.set    { enabled?, pause? }                      持久化开关 (写 MODE_FILE; 缺省的字段不改动)
+			// mode.pause  { pause } (v0.9.0)                        只切"高峰暂停"子开关 (保留 enabled/exempt/debug)
+			// mode.exempt { sessionId, exempt } (v0.8.0)            单会话豁免切换 (高峰照常发送; 豁免时立即恢复)
 			// mode.debug  { debug: auto|peak|offpeak } (v0.8.3)     强制当前时段 (调试; 客户端拦截与服务端派发同口径)
 			// diag        { event, ...} (v0.8.3)                    客户端诊断上报 (落 log/taskqueue/offpeak-debug.log)
 			// diag.get    → { recent, file }                        回读最近诊断 (无控制台远程取证)
@@ -1560,14 +2060,30 @@ export async function apply(ctx, config) {
 			case "mode.get": {
 				const mode = await readMode();
 				const windowsNow = await resolveWindows();
-				return { ok: true, value: { ...modeValue(mode, windowsNow, windowSource), diag: diagRecent.slice(-8) } };
+				return { ok: true, value: { ...modeOut(mode, windowsNow), diag: diagRecent.slice(-8) } };
 			}
 			case "mode.set": {
-				const enabled = payload?.enabled === true;
 				const cur = await readMode();
-				await writeMode({ enabled, exempt: cur.exempt, debug: cur.debug });
+				// 缺省 = 不改动该字段 (客户端只切一个开关时不会误清另一个); 显式传值时按既有语义取值
+				const next = { enabled: cur.enabled, exempt: cur.exempt, debug: cur.debug, pause: cur.pause };
+				if (payload && Object.prototype.hasOwnProperty.call(payload, "enabled")) next.enabled = payload.enabled === true;
+				if (payload && Object.prototype.hasOwnProperty.call(payload, "pause")) next.pause = payload.pause !== false;
+				await writeMode(next);
+				if (next.pause === false) releaseAllForReason("pause-off");
 				const windowsNow = await resolveWindows();
-				return { ok: true, value: modeValue({ enabled, exempt: cur.exempt, debug: cur.debug }, windowsNow, windowSource) };
+				return { ok: true, value: modeOut(next, windowsNow) };
+			}
+			case "mode.pause": {
+				if (typeof payload?.pause !== "boolean") {
+					return { ok: false, error: { code: "bad-request", message: "需要 pause(布尔)" } };
+				}
+				const cur = await readMode();
+				const next = { enabled: cur.enabled, exempt: cur.exempt, debug: cur.debug, pause: payload.pause };
+				await writeMode(next);
+				await appendDiag({ event: payload.pause ? "pause.switch-on" : "pause.switch-off", via: "rpc" });
+				if (!payload.pause) releaseAllForReason("pause-off");
+				const windowsNow = await resolveWindows();
+				return { ok: true, value: modeOut(next, windowsNow) };
 			}
 			case "mode.exempt": {
 				const sessionId = typeof payload?.sessionId === "string" ? payload.sessionId : "";
@@ -1576,12 +2092,11 @@ export async function apply(ctx, config) {
 					return { ok: false, error: { code: "bad-request", message: "需要 sessionId(当前会话)" } };
 				}
 				const cur = await readMode();
-				const exemptMap = { ...cur.exempt };
-				if (exempt) exemptMap[sessionId] = true;
-				else delete exemptMap[sessionId];
-				await writeMode({ enabled: cur.enabled, exempt: exemptMap, debug: cur.debug });
+				const exemptMap = await setExemptMap(sessionId, exempt);
+				// 豁免本会话 ⇒ 等待中的回合立即恢复执行 (与轮询器同口径, 但不等 15s)
+				if (exempt) { const w = pauseWaiters.get(sessionId); if (w) releaseWaiter(w, "exempt"); }
 				const windowsNow = await resolveWindows();
-				return { ok: true, value: modeValue({ enabled: cur.enabled, exempt: exemptMap, debug: cur.debug }, windowsNow, windowSource) };
+				return { ok: true, value: modeOut({ enabled: cur.enabled, exempt: exemptMap, debug: cur.debug, pause: cur.pause }, windowsNow) };
 			}
 			// v0.8.3 强制时段 (debug): 平峰期实测错峰功能用 —— "peak" = 当作高峰(消息入队/队列不派发),
 			// "offpeak" = 当作平峰(消息直发/到期任务立即派发), "auto" = 恢复官方页判定。
@@ -1592,10 +2107,11 @@ export async function apply(ctx, config) {
 					return { ok: false, error: { code: "bad-request", message: `debug 只接受 ${DEBUG_VALUES.join(" / ")}` } };
 				}
 				const cur = await readMode();
-				await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug });
+				await writeMode({ enabled: cur.enabled, exempt: cur.exempt, debug, pause: cur.pause });
 				const windowsNow = await resolveWindows();
 				await appendDiag({ event: "mode.debug", debug });
-				return { ok: true, value: modeValue({ enabled: cur.enabled, exempt: cur.exempt, debug }, windowsNow, windowSource) };
+				if (debug === "offpeak") releaseAllForReason("offpeak"); // 强制平峰 ⇒ 等待中的回合立即恢复
+				return { ok: true, value: modeOut({ enabled: cur.enabled, exempt: cur.exempt, debug, pause: cur.pause }, windowsNow) };
 			}
 			// v0.8.3 客户端诊断: 错峰拦截器在浏览器里, 静默失效时无从取证 —— 客户端 apply/渲染/命中都上报。
 			case "diag": {

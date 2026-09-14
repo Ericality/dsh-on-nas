@@ -55,6 +55,9 @@ window.__ModuleLoader__.load({
 			statusOffpeak: "当前平峰时段 · 消息正常发送",
 			statusLoading: "状态读取中…",
 			statusError: "状态读取失败, 请刷新重试",
+			// v0.8.6: 拦截器未安装 (宿主升级导致挂点变更等) —— "宁愿报错也不静默直发"
+			statusBroken: "⚠ 拦截器未安装 · 消息将直发 (按高峰价), 请强刷页面",
+			descBroken: "错峰拦截未安装：当前高峰时段消息不会被拦截入队，而是直接发送（按高峰价计费）。请强刷页面；仍无效则查 /queue/diag.get。",
 			saved: "✓ 已保存",
 			pillPeak: "高峰 · 自动入队",
 			pillExempt: "本会话立即发送",
@@ -64,6 +67,15 @@ window.__ModuleLoader__.load({
 			descExempt: "本会话已豁免错峰：高峰时段消息也立即发送，不入队。",
 			descOffpeak: "当前为平峰时段，消息正常发送。",
 			popRowLabel: "本会话立即发送",
+			// v0.9.0: 高峰暂停 (全局子开关 + 本会话暂停态)
+			pauseLabel: "高峰暂停",
+			pauseHint: "高峰时段把正在跑的回合停在步骤边界, 到低谷自动继续 (等待期零 token; 关闭则高峰照常跑完)",
+			pauseRowLabel: "高峰暂停 (全局)",
+			pauseAria: "高峰暂停开关 (全局): 高峰期把正在跑的 agent 回合停在步骤边界",
+			pauseBroken: "暂停闸门未安装（本版本宿主不兼容）",
+			pillPaused: "⏸ 暂停中",
+			statusPaused: "已暂停 · 预计 %s 继续",
+			descPaused: "本会话的回合已停在步骤边界，等低谷价时段到达后自动继续（等待期零 token，不打断上下文）。",
 			triggerAria: "错峰状态：%s（点击查看/操作）",
 			ariaLabel: "错峰出行模式开关",
 			switchAria: "本会话立即发送 (豁免错峰, 高峰照常发送)",
@@ -80,6 +92,9 @@ window.__ModuleLoader__.load({
 			statusOffpeak: "Off-peak now · messages send normally",
 			statusLoading: "Loading status…",
 			statusError: "Failed to load status, please refresh",
+			// v0.8.6: interceptor not installed → fail loud instead of silently sending at peak price
+			statusBroken: "⚠ Interceptor not installed · messages send directly (peak price), please hard-reload",
+			descBroken: "Off-peak interceptor is NOT installed: peak-hour messages are sent directly (billed at peak price) instead of being queued. Hard-reload the page; if it persists, check /queue/diag.get.",
 			saved: "✓ Saved",
 			pillPeak: "Peak · auto-queue",
 			pillExempt: "Send now (this session)",
@@ -88,6 +103,15 @@ window.__ModuleLoader__.load({
 			descExempt: "This session bypasses off-peak mode: messages send immediately even during peak hours.",
 			descOffpeak: "Off-peak now: messages send normally.",
 			popRowLabel: "Send now in this session",
+			// v0.9.0: peak-pause (global sub-switch + per-session paused state)
+			pauseLabel: "Peak pause",
+			pauseHint: "During peak hours a running turn is parked at the step boundary and resumes in the off-peak window (zero tokens while waiting; off = peak turns run to completion)",
+			pauseRowLabel: "Peak pause (global)",
+			pauseAria: "Peak pause switch (global): park running agent turns at the step boundary during peak hours",
+			pauseBroken: "Pause gate NOT installed (host incompatible)",
+			pillPaused: "⏸ Paused",
+			statusPaused: "Paused · resumes ~%s",
+			descPaused: "This session's turn is parked at the step boundary and resumes automatically when the off-peak window starts (zero tokens while waiting, context kept).",
 			triggerAria: "Off-peak status: %s (click to view / act)",
 			ariaLabel: "Off-peak travel mode toggle",
 			switchAria: "Send immediately in this session (bypass peak queue)",
@@ -110,6 +134,8 @@ window.__ModuleLoader__.load({
 			".dsh-tq-status{font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary)}",
 			".dsh-tq-status[data-state=\"peak\"]{color:var(--dsw-alias-state-warn-primary,#f59e0b)}",
 			".dsh-tq-status[data-state=\"offpeak\"]{color:var(--dsw-alias-state-success-primary,#22c55e)}",
+			// v0.8.6: 拦截器未安装 = 红字告警 (不再伪装成"平峰正常发送")
+			".dsh-tq-status[data-state=\"broken\"]{color:var(--dsw-alias-state-error-primary,#ef4444);font-weight:600}",
 			".dsh-tq-hint{font-size:12px;color:var(--dsw-alias-label-tertiary);margin:0}",
 			// v0.8.2 触发器 (Full access 行右侧, conversation.input.left):
 			// 宽屏=完整文案药丸(.dsh-tq-pill, button) / 窄屏(≤640px)=26×26 图标(.dsh-tq-icon, 同 access 收缩);
@@ -118,8 +144,10 @@ window.__ModuleLoader__.load({
 			".dsh-tq-pill{display:inline-flex;align-items:center;gap:5px;box-sizing:border-box;height:26px;margin:0;padding:0 10px;border-radius:999px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary);font-family:inherit;font-size:11.5px;line-height:1;white-space:nowrap;cursor:pointer;user-select:none;flex:none;min-width:0;max-width:100%;overflow:hidden}",
 			".dsh-tq-pill .dsh-tq-dot,.dsh-tq-icon .dsh-tq-dot,.dsh-tq-pop .dsh-tq-dot{width:7px;height:7px;border-radius:50%;flex:none;background:currentColor}",
 			".dsh-tq-pill .dsh-tq-txt{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}",
-			".dsh-tq-pill[data-state=\"peak\"],.dsh-tq-icon[data-state=\"peak\"]{color:var(--dsw-alias-state-warn-primary,#f59e0b);border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 12%,transparent)}",
+			".dsh-tq-pill[data-state=\"peak\"],.dsh-tq-icon[data-state=\"peak\"],.dsh-tq-pill[data-state=\"paused\"],.dsh-tq-icon[data-state=\"paused\"]{color:var(--dsw-alias-state-warn-primary,#f59e0b);border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 12%,transparent)}",
 			".dsh-tq-pill[data-state=\"exempt\"],.dsh-tq-pill[data-state=\"offpeak\"],.dsh-tq-icon[data-state=\"exempt\"],.dsh-tq-icon[data-state=\"offpeak\"]{color:var(--dsw-alias-state-success-primary,#22c55e);border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 40%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 11%,transparent)}",
+			// v0.8.6: 未安装态 (红) —— 药丸/图标/弹层标题 + composer 边框同色
+			".dsh-tq-pill[data-state=\"broken\"],.dsh-tq-icon[data-state=\"broken\"]{color:var(--dsw-alias-state-error-primary,#ef4444);border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary,#ef4444) 45%,transparent);background:color-mix(in srgb,var(--dsw-alias-state-error-primary,#ef4444) 12%,transparent)}",
 			".dsh-tq-icon{display:none;align-items:center;justify-content:center;box-sizing:border-box;width:26px;height:26px;margin:0;padding:0;border-radius:8px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);color:var(--dsw-alias-label-secondary);font-family:inherit;cursor:pointer;flex:none}",
 			"@media (max-width:640px){.dsh-tq-pill{display:none}.dsh-tq-icon{display:inline-flex}}",
 			// 弹层内开关 (v0.8.2 起豁免开关统一收进弹层; 28×16 同 v0.8.0 药丸内小开关)
@@ -131,14 +159,16 @@ window.__ModuleLoader__.load({
 			".dsh-tq-pop{display:none;box-sizing:border-box;position:fixed;z-index:9999;width:240px;padding:10px 12px;border-radius:12px;border:1px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-module-platform);box-shadow:0 8px 32px rgba(0,0,0,.35);text-align:left}",
 			".dsh-tq-pop.dsh-tq-pop-open{display:block}",
 			".dsh-tq-pop-title{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;line-height:1.4;color:var(--dsw-alias-label-primary)}",
-			".dsh-tq-pop[data-state=\"peak\"] .dsh-tq-pop-title{color:var(--dsw-alias-state-warn-primary,#f59e0b)}",
+			".dsh-tq-pop[data-state=\"peak\"] .dsh-tq-pop-title,.dsh-tq-pop[data-state=\"paused\"] .dsh-tq-pop-title{color:var(--dsw-alias-state-warn-primary,#f59e0b)}",
 			".dsh-tq-pop[data-state=\"exempt\"] .dsh-tq-pop-title,.dsh-tq-pop[data-state=\"offpeak\"] .dsh-tq-pop-title{color:var(--dsw-alias-state-success-primary,#22c55e)}",
+			".dsh-tq-pop[data-state=\"broken\"] .dsh-tq-pop-title{color:var(--dsw-alias-state-error-primary,#ef4444)}",
 			".dsh-tq-pop-desc{margin-top:6px;font-size:11.5px;line-height:1.55;color:var(--dsw-alias-label-secondary)}",
 			".dsh-tq-pop-row{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:10px;padding-top:9px;border-top:1px dashed var(--dsw-alias-border-l2);font-size:12px;color:var(--dsw-alias-label-primary)}",
 			// 输入框边框随状态着色 (:has() 纯 CSS, 药丸/图标任一在 composer 卡内即着色;
 			// 平峰不着色; 模式关闭无触发器自然不着色)
-			"[data-composer-card]:has(.dsh-tq-pill[data-state=\"peak\"],.dsh-tq-icon[data-state=\"peak\"]){border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 55%,transparent) !important}",
-			"[data-composer-card]:has(.dsh-tq-pill[data-state=\"exempt\"],.dsh-tq-icon[data-state=\"exempt\"]){border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 50%,transparent) !important}"
+			"[data-composer-card]:has(.dsh-tq-pill[data-state=\"peak\"],.dsh-tq-icon[data-state=\"peak\"],.dsh-tq-pill[data-state=\"paused\"],.dsh-tq-icon[data-state=\"paused\"]){border-color:color-mix(in srgb,var(--dsw-alias-state-warn-primary,#f59e0b) 55%,transparent) !important}",
+			"[data-composer-card]:has(.dsh-tq-pill[data-state=\"exempt\"],.dsh-tq-icon[data-state=\"exempt\"]){border-color:color-mix(in srgb,var(--dsw-alias-state-success-primary,#22c55e) 50%,transparent) !important}",
+			"[data-composer-card]:has(.dsh-tq-pill[data-state=\"broken\"],.dsh-tq-icon[data-state=\"broken\"]){border-color:color-mix(in srgb,var(--dsw-alias-state-error-primary,#ef4444) 55%,transparent) !important}"
 		].join("");
 
 		function injectCss() {
@@ -161,7 +191,7 @@ window.__ModuleLoader__.load({
 		var UI_POLL_MS = 15 * 1000;
 
 		function createController(connection) {
-			var store = createSnapshotStore({ status: "loading", loaded: false, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {} });
+			var store = createSnapshotStore({ status: "loading", loaded: false, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {}, pause: true, paused: { count: 0, sessions: [] }, pauseInstalled: true });
 			var cached = null; // { at, value }
 			function call(endpoint, payload) {
 				var rpc = connection && connection.rpc;
@@ -180,6 +210,12 @@ window.__ModuleLoader__.load({
 					return void call("diag", { event: event, detail: detail || {} });
 				} catch (e) { /* 诊断失败绝不影响功能 */ }
 			}
+			/** v0.9.0: paused 摘要归一 (服务端 mode.get 新增字段; 老服务端没有 ⇒ 空摘要) */
+			function pausedOf(value) {
+				var p = value && value.paused;
+				if (!p || typeof p !== "object" || !Array.isArray(p.sessions)) return { count: 0, sessions: [] };
+				return { count: typeof p.count === "number" ? p.count : p.sessions.length, sessions: p.sessions };
+			}
 			function publish(value) {
 				store.set({
 					status: "ready",
@@ -189,7 +225,10 @@ window.__ModuleLoader__.load({
 					windowSource: String(value.windowSource || ""),
 					peakSource: String(value.peakSource || value.windowSource || ""),
 					debug: String(value.debug || "auto"),
-					exempt: (value.exempt && typeof value.exempt === "object") ? value.exempt : {}
+					exempt: (value.exempt && typeof value.exempt === "object") ? value.exempt : {},
+					pause: value.pause !== false,
+					pauseInstalled: value.pauseInstalled !== false, // v0.9.0: 闸门自检失败 ⇒ 设置卡加一句可见提示
+					paused: pausedOf(value)
 				});
 			}
 			function refresh(force, ttlMs) {
@@ -201,13 +240,25 @@ window.__ModuleLoader__.load({
 						publish(res.value);
 						return res.value;
 					}
-					store.set({ status: "error", loaded: true, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {} });
+					store.set({ status: "error", loaded: true, enabled: false, peak: false, windowSource: "", peakSource: "", debug: "auto", exempt: {}, pause: true, paused: { count: 0, sessions: [] }, pauseInstalled: true });
 					return null;
 				});
 			}
 			refresh(true);
 			// 周期性兜底刷新 (开关状态变化/时段切换/强制时段切换), 不阻塞任何操作
 			setInterval(function () { void refresh(false, UI_POLL_MS); }, UI_POLL_MS);
+			/** v0.9.0 降级: RPC 失败 ⇒ 回退 UI 到服务端真实状态 (不以乐观值骗用户) */
+			function resync() {
+				return refresh(true).then(function () { return null; }, function () { return null; });
+			}
+			function setter(endpoint, payload, res) {
+				if (res && res.ok) {
+					cached = { at: Date.now(), value: res.value };
+					publish(res.value);
+					return res;
+				}
+				return resync().then(function () { return res; }); // 失败 ⇒ 回退到服务端真实状态
+			}
 			return {
 				store: store,
 				report: report,
@@ -215,22 +266,14 @@ window.__ModuleLoader__.load({
 				// 拦截判定用短 TTL (v0.8.3): 强制时段/豁免切换 ≤5s 生效, 避免"以为没生效"
 				getStatus: function () { return refresh(false, PROMPT_TTL_MS); },
 				setEnabled: function (enabled) {
-					return call("mode.set", { enabled: enabled === true }).then(function (res) {
-						if (res.ok) {
-							cached = { at: Date.now(), value: res.value };
-							publish(res.value);
-						}
-						return res;
-					});
+					return call("mode.set", { enabled: enabled === true }).then(function (res) { return setter("mode.set", null, res); });
+				},
+				// v0.9.0 高峰暂停子开关 (全局): mode.set 只带 pause ⇒ 服务端不动其它字段
+				setPause: function (pause) {
+					return call("mode.set", { pause: pause === true }).then(function (res) { return setter("mode.set", null, res); });
 				},
 				setExempt: function (sessionId, exempt) {
-					return call("mode.exempt", { sessionId: sessionId, exempt: exempt === true }).then(function (res) {
-						if (res.ok) {
-							cached = { at: Date.now(), value: res.value };
-							publish(res.value);
-						}
-						return res;
-					});
+					return call("mode.exempt", { sessionId: sessionId, exempt: exempt === true }).then(function (res) { return setter("mode.exempt", null, res); });
 				},
 				addTask: function (content, sessionId) {
 					return call("add", { content: content, sessionId: sessionId });
@@ -262,8 +305,14 @@ window.__ModuleLoader__.load({
 		var captureSessionFn = null; // 由 installPromptInterceptor 赋值; 药丸/槽位渲染时把会话实例喂进来
 		var lastPillDiagKey = "";
 		// 诊断状态 (供 CDP/E2E 与用户自查: window.__dshTaskqueueDebug)
-		var debugState = { version: "0.8.5", installed: false, sendPatched: false, sessionId: null, lastEvent: null, lastAt: 0 };
+		var debugState = { version: "0.8.6", installed: false, sendPatched: false, sessionId: null, lastEvent: null, lastAt: 0 };
 		try { window.__dshTaskqueueDebug = debugState; } catch (e) { /* 非浏览器环境忽略 */ }
+		/** v0.8.6: 错峰拦截是否"确定未安装" —— 渲染期读取 (不缓存: 拦截器是异步补挂的)。
+		 *  fail-loud 语义: 未安装 = 高峰消息会直发 (按高峰价), UI 必须显示红字告警,
+		 *  绝不伪装成"平峰 · 正常发送" (历史三次静默失效: 坑 14/16/22)。 */
+		function interceptorMissing() {
+			try { return debugState.installed !== true; } catch (e) { return false; }
+		}
 		function diag(controller, event, detail) {
 			debugState.lastEvent = event;
 			debugState.lastAt = Date.now();
@@ -473,13 +522,16 @@ window.__ModuleLoader__.load({
 			} catch (e) { diag(controller, "retry.unavailable", { error: String((e && e.message) || e) }); }
 		}
 
-		// ---------- 设置卡: 错峰出行模式开关 + 状态 ----------
+		// ---------- 设置卡: 错峰出行模式开关 + 高峰暂停子开关 + 状态 ----------
 		function TaskQueueCard(props) {
 			var t = props.t;
 			var state = props.useTaskQueue(function (s) { return s; });
 			var loaded = !!state.loaded;
 			var busy = React.useRef(false);
 			var [flash, setFlash] = React.useState(false);
+			// v0.9.0: 高峰暂停子开关 (全局, 与胶囊弹层同一个 RPC mode.set {pause})
+			var pauseBusy = React.useRef(false);
+			var [pauseFlash, setPauseFlash] = React.useState(false);
 			function toggle() {
 				if (busy.current) return;
 				busy.current = true;
@@ -489,14 +541,31 @@ window.__ModuleLoader__.load({
 					setTimeout(function () { setFlash(false); }, 1200);
 				}, function () { busy.current = false; });
 			}
+			function togglePause() {
+				if (pauseBusy.current || typeof props.setPause !== "function") return;
+				pauseBusy.current = true;
+				props.setPause(state.pause === false).then(function () {
+					pauseBusy.current = false;
+					setPauseFlash(true);
+					setTimeout(function () { setPauseFlash(false); }, 1200);
+				}, function () { pauseBusy.current = false; });
+			}
 			var statusState = !loaded ? "loading" : state.status === "error" ? "error" : (state.enabled ? (state.peak ? "peak" : "offpeak") : "off");
+			// v0.8.6: 模式开着但拦截器没装上 ⇒ 红字告警 (否则会显示"平峰·正常发送"误导用户)
+			var broken = state.enabled === true && loaded && state.status !== "error" && interceptorMissing();
+			if (broken) statusState = "broken";
 			// v0.8.3 debug: 强制时段时在状态文案后明确标注 (只读显示; 防"忘记关")
 			var forced = state.debug && state.debug !== "auto" ? " [强制 " + state.debug + " · debug]" : "";
+			// v0.9.0: 闸门自检失败 ⇒ 状态文案追加一句 (可见性; 服务端仍照常工作, 只是不暂停)
 			var statusText = statusState === "loading" ? t("statusLoading")
 				: statusState === "error" ? t("statusError")
-					: statusState === "peak" ? t("statusPeak") + forced
-						: statusState === "offpeak" ? t("statusOffpeak") + forced
-							: "";
+					: statusState === "broken" ? t("statusBroken")
+						: statusState === "peak" ? t("statusPeak") + forced
+							: statusState === "offpeak" ? t("statusOffpeak") + forced
+								: "";
+			if (loaded && state.pauseInstalled === false) {
+				statusText = (statusText ? statusText + " · " : "") + t("pauseBroken");
+			}
 			return React.createElement("div", { className: "dsh-tq-card" }, [
 				React.createElement("div", { className: "dsh-tq-qhead" }, [
 					React.createElement("b", null, t("cardTitle")),
@@ -517,7 +586,22 @@ window.__ModuleLoader__.load({
 					]),
 					React.createElement("span", { className: "dsh-tq-status", "data-state": statusState }, statusText),
 					React.createElement("p", { className: "dsh-tq-hint" }, t("modeOnHint")),
-					React.createElement("p", { className: "dsh-tq-hint" }, flash ? t("saved") : "")
+					React.createElement("div", { className: "dsh-tq-mode-row" }, [
+						React.createElement("b", null, t("pauseLabel")),
+						React.createElement("button", {
+							type: "button",
+							className: "dsh-tq-switch",
+							"data-tq": "pause-switch",
+							role: "switch",
+							"aria-checked": state.pause !== false,
+							"aria-label": t("pauseAria"),
+							"data-on": state.pause !== false ? "true" : "false",
+							onClick: togglePause
+						})
+					]),
+					React.createElement("p", { className: "dsh-tq-hint" }, t("pauseHint")),
+					React.createElement("p", { className: "dsh-tq-hint" }, flash ? t("saved") : ""),
+					React.createElement("p", { className: "dsh-tq-hint" }, pauseFlash ? t("saved") : "")
 				])
 			]);
 		}
@@ -549,14 +633,47 @@ window.__ModuleLoader__.load({
 			var sessionId = props.sessionId || (session && (session.id || session.sessionId)) || null;
 			var exempt = !!(ready && sessionId && state.exempt && state.exempt[sessionId] === true);
 			var peak = state.peak === true;
-			var pillState = !ready ? "offpeak" : (exempt ? "exempt" : (peak ? "peak" : "offpeak"));
-			var label = !ready ? "" : (exempt ? t("pillExempt") : (peak ? t("pillPeak") : t("pillOffpeak")));
-			var desc = !ready ? "" : (exempt ? t("descExempt") : (peak ? t("descPeak") : t("descOffpeak")));
+			// v0.9.0: 本会话是否正在"高峰暂停" (服务端 paused.sessions 含当前会话)
+			var pausedRec = null;
+			if (ready && sessionId && state.paused && Array.isArray(state.paused.sessions)) {
+				for (var i = 0; i < state.paused.sessions.length; i++) {
+					var rec = state.paused.sessions[i];
+					if (rec && rec.sessionId === sessionId) { pausedRec = rec; break; }
+				}
+			}
+			// 预计恢复时刻 (北京时区 HH:MM; 解析失败则不显示)
+			var resumeHm = "";
+			try {
+				if (pausedRec && pausedRec.nextOffpeakAt) {
+					var d = new Date(pausedRec.nextOffpeakAt);
+					if (!isNaN(d.getTime())) {
+						resumeHm = new Date(d.getTime() + 8 * 3600 * 1000).toISOString().slice(11, 16);
+					}
+				}
+			} catch (e) { resumeHm = ""; }
+			var paused = !!pausedRec;
+			var pillState = !ready ? "offpeak" : (paused ? "paused" : (exempt ? "exempt" : (peak ? "peak" : "offpeak")));
+			var label = !ready ? "" : (paused ? t("pillPaused") : (exempt ? t("pillExempt") : (peak ? t("pillPeak") : t("pillOffpeak"))));
+			var desc = !ready ? "" : (paused ? t("descPaused") : (exempt ? t("descExempt") : (peak ? t("descPeak") : t("descOffpeak"))));
+			// v0.8.6 fail-loud: 拦截器未安装 ⇒ 红态 + 说清"消息将直发 (按高峰价)"
+			if (ready && interceptorMissing()) {
+				pillState = "broken";
+				label = t("statusBroken");
+				desc = t("descBroken");
+			}
 			var aria = label ? t("triggerAria").replace("%s", label) : "";
 			function toggleExempt() {
 				if (busy.current || !props.setExempt || !sessionId) return;
 				busy.current = true;
 				props.setExempt(sessionId, !exempt).then(function () {
+					busy.current = false;
+				}, function () { busy.current = false; });
+			}
+			// v0.9.0: 全局「高峰暂停」开关 (RPC mode.set {pause}; 失败 ⇒ controller 已回退 UI 到服务端真实状态)
+			function togglePause() {
+				if (busy.current || typeof props.setPause !== "function") return;
+				busy.current = true;
+				props.setPause(state.pause === false).then(function () {
 					busy.current = false;
 				}, function () { busy.current = false; });
 			}
@@ -619,11 +736,26 @@ window.__ModuleLoader__.load({
 					window.removeEventListener("resize", place);
 					window.removeEventListener("scroll", place, true);
 				};
-			}, [open, exempt, peak]);
+			}, [open, exempt, peak, paused]);
 			if (!ready || !sessionId) return null;
 			var popEl = null;
 			if (open) {
 				var rows = [];
+				// v0.9.0: ① 全局「高峰暂停」开关 (服务端 mode.set {pause})
+				rows.push(React.createElement("div", { className: "dsh-tq-pop-row", key: "sw-pause" }, [
+					React.createElement("span", null, t("pauseRowLabel")),
+					React.createElement("button", {
+						type: "button",
+						className: "dsh-tq-sw",
+						"data-tq": "pause-switch",
+						role: "switch",
+						"aria-checked": state.pause !== false,
+						"aria-label": t("pauseAria"),
+						"data-on": state.pause !== false ? "true" : "false",
+												onClick: togglePause
+					})
+				]));
+				// ② 本会话豁免 (v0.8.2 起统一收在弹层; 仅在高峰时有意义)
 				if (peak) {
 					rows.push(React.createElement("div", { className: "dsh-tq-pop-row", key: "sw" }, [
 						React.createElement("span", null, t("popRowLabel")),
@@ -634,8 +766,7 @@ window.__ModuleLoader__.load({
 							"aria-checked": exempt,
 							"aria-label": exempt ? t("switchAriaOn") : t("switchAria"),
 							"data-on": exempt ? "true" : "false",
-							disabled: busy.current ? true : false,
-							onClick: toggleExempt
+														onClick: toggleExempt
 						})
 					]));
 				}
@@ -651,6 +782,8 @@ window.__ModuleLoader__.load({
 						React.createElement("span", null, label)
 					]),
 					React.createElement("div", { className: "dsh-tq-pop-desc" }, desc),
+					// v0.9.0 状态行: 暂停中显示"已暂停 · 预计 HH:MM 继续"
+					paused && resumeHm ? React.createElement("div", { className: "dsh-tq-pop-desc", "data-tq": "paused-line" }, t("statusPaused").replace("%s", resumeHm)) : null,
 					rows
 				]);
 			}
@@ -709,6 +842,7 @@ window.__ModuleLoader__.load({
 						return {
 							hooks: { taskQueue: controller.store },
 							setExempt: controller.setExempt,
+							setPause: controller.setPause, // v0.9.0: 全局高峰暂停开关
 							report: controller.report
 						};
 					}
@@ -724,7 +858,8 @@ window.__ModuleLoader__.load({
 					inject: function () {
 						return {
 							hooks: { taskQueue: controller.store },
-							setEnabled: controller.setEnabled
+							setEnabled: controller.setEnabled,
+							setPause: controller.setPause // v0.9.0: 设置卡里的高峰暂停开关 (同一 RPC)
 						};
 					}
 				}, TaskQueueCard);
@@ -733,6 +868,16 @@ window.__ModuleLoader__.load({
 
 		exports.inject = inject;
 		exports.apply = apply;
+		// v0.8.6: 冒烟/对撞测试专用导出 (仅 window.__DSH_SMOKE__ 置位时; 生产浏览器不置位不启用)
+		if (typeof window !== "undefined" && window.__DSH_SMOKE__) {
+			exports.__test = {
+				TaskQueuePill: TaskQueuePill,
+				TaskQueueCard: TaskQueueCard,
+				dictZh: zh,
+				interceptorMissing: interceptorMissing,
+				debugState: debugState
+			};
+		}
 		return module.exports;
 	}
 });
