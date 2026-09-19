@@ -318,6 +318,17 @@ function checkCreds(u, p) {
 const DEBUG = process.env.DSH_AUTH_DEBUG === '1';
 function dlog(...a) { if (DEBUG) console.log('[auth]', ...a); }
 
+// ---- 进程级兜底 (2026-09-19): 未捕获异常不再拖垮容器 ----
+// 背景: dsh-entrypoint 用 `while kill -0 dsh_pid && kill -0 proxy_pid` 守着两个子进程,
+// 任一退出 ⇒ PID 1 退出 ⇒ restart=unless-stopped 把整个容器重启(用户侧表现为"莫名重启")。
+// ⇒ 请求级异常先由 safeBaseUrl 兜住(见 handleUpgrade/handler), 这里再兜"任何其它未捕获异常": 只记录不退出。
+process.on('uncaughtException', (e) => {
+  try { console.error('[auth] uncaughtException (进程保持存活):', (e && e.stack) || String(e)); } catch { /* ignore */ }
+});
+process.on('unhandledRejection', (r) => {
+  try { console.error('[auth] unhandledRejection (进程保持存活):', (r && r.stack) || String(r)); } catch { /* ignore */ }
+});
+
 // ============================================================
 // 安全内核 (2026-09-12, Stage 2): TOTP 二次验证 / 设备信任 / 恢复码 / 多档限速 / 告警
 // ------------------------------------------------------------
@@ -2438,8 +2449,40 @@ function proxy(req, res, retried = false) {
 // dsh 的实时事件流走 /api/remote.mux 一条 WebSocket 下行连接 (dsh 0.1.2 起;
 // 更早版本的 /api/events.mux 与 /api/events.host 已不存在, 2026-09-11 VM 实测确认),
 // 普通 HTTP 代理不处理 Upgrade 请求, 必须单独转发 (否则界面无实时更新, 只能刷新看进度)
+// ---- Host 头安全解析 (2026-09-19) ----
+// 背景: 裸 IPv6 Host (如 "fda2:4e98:...:e44a:8443", 不带方括号) 会让 new URL() 抛
+// ERR_INVALID_URL; 该异常发生在请求处理器首行且无捕获 ⇒ auth-proxy 进程退出 ⇒
+// entrypoint(PID 1) 随之退出 ⇒ 容器整体重启(2026-09-14~09-19 生产实测 6 次, 详见
+// docs/任务记录/2026-09-19-容器自动重启根因-auth-proxy崩溃.md)。
+// 处置: ① 裸 IPv6 自动补方括号 (浏览器按 RFC 带括号, 触发方多为脚本/扫描器/中间层)
+//       ② 仍解析失败 ⇒ 返回 null, 由调用方以 400 拒绝并写审计(BAD_HOST, 用于定位触发源)
+//       ③ 进程级兜底见文件上方 uncaughtException/unhandledRejection
+function safeBaseUrl(req) {
+  // 只用 Host 作 base 来解析 req.url(路径/查询); 且保证"只要能解析路径就不判坏"。
+  // ⚠️ 不能简单按"含冒号即裸 IPv6"补括号: 127.0.0.1:3082 的端口冒号会被误判 ⇒ 全量 400
+  //    (VM 场实测一次)。改为多候选逐个试 + localhost 兜底。
+  const target = req.url || '/';
+  const raw = String(req.headers.host || '');
+  const bases = [];
+  if (raw) {
+    bases.push(`http://${raw}`);                                // 正常形态: 域名 / IPv4[:port] / [IPv6][:port]
+    if (!raw.startsWith('[')) bases.push(`http://[${raw}]`);    // 裸 IPv6(无方括号): 补括号再试
+  }
+  bases.push('http://localhost');                               // 兜底: Host 不可用也照常解析路径
+  for (const base of bases) {
+    try { return new URL(target, base); } catch { /* 试下一个候选 */ }
+  }
+  return null;   // 仅当 req.url 本身不可解析才判坏
+}
+
 function handleUpgrade(req, socket, head, retried = false) {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const url = safeBaseUrl(req);
+  if (url === null) {
+    audit('BAD_HOST', { kind: 'ws', from: clientIp(req), host: req.headers.host, url: req.url });
+    socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
   const reject = (code, msg) => {
     dlog('ws-reject', url.pathname, 'from', clientIp(req), '->', msg);
     socket.write(`HTTP/1.1 ${code} ${msg}\r\nConnection: close\r\n\r\n`);
@@ -2506,7 +2549,13 @@ function clientIp(req) {
 }
 
 const handler = (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const url = safeBaseUrl(req);
+  if (url === null) {
+    audit('BAD_HOST', { kind: 'http', from: clientIp(req), host: req.headers.host, url: req.url });
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bad Request\n');
+    return;
+  }
   const ip = clientIp(req);
   const host = req.headers.host || '';
   // 明文 HTTP + 非 localhost + 非隧道 -> 提示改用 HTTPS (安全上下文问题)
