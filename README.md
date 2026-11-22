@@ -10,6 +10,7 @@
   - `3080` HTTP:供反向代理 / 隧道回源 / SSH 隧道使用
   - `8443` HTTPS(可选):供局域网直连,启动时自动生成自签名证书
 - **版本自动跟随**:GitHub Actions 自动查询 npm 最新版本并重建镜像,也可手动指定版本
+- **构建底座 node:24 LTS**(Krypton,digest 固定):dsh 0.2.2 起要求 `engines.node >= 24.9.0`,旧的 node:22 底座已不再受官方支持
 - **可复现构建**:基础镜像 digest 固定,全部构建源码在仓库内
 
 ## 架构
@@ -55,7 +56,7 @@ ghcr.io/<用户名>/dsh-nas:latest
 ```bash
 ./build.sh                    # 构建 npm latest 版本
 ./build.sh next               # 构建 npm next 版本 (尝鲜)
-DSH_VERSION=0.1.0-rc.8 ./build.sh
+DSH_VERSION=0.2.2-rc.5 ./build.sh
 NPM_REGISTRY=https://registry.npmmirror.com ./build.sh   # 国内 npm 镜像
 ```
 

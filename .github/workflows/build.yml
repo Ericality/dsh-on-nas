@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       dsh_version:
-        description: 'DSH 版本 (例如 0.1.0-rc.8); 留空 = 自动用 npm latest'
+        description: 'DSH 版本 (例如 0.2.2-rc.5); 留空 = 自动用 npm latest'
         required: false
         default: ''
       npm_registry:
@@ -45,7 +45,7 @@ jobs:
           if [ -n "${{ inputs.dsh_version }}" ]; then
             V="${{ inputs.dsh_version }}"
           else
-            V="$(docker run --rm node:22-alpine npm view @deepseek-ai/dsh@latest version 2>/dev/null | tail -1)"
+            V="$(docker run --rm node:24-alpine npm view @deepseek-ai/dsh@latest version 2>/dev/null | tail -1)"
           fi
           if [ -z "$V" ]; then
             echo "!! 无法获取版本号" >&2
@@ -103,7 +103,7 @@ jobs:
           file: ${{ matrix.dockerfile }}
           build-args: |
             DSH_VERSION=${{ needs.resolve-version.outputs.version }}
-            NPM_REGISTRY=${{ inputs.npm_registry }}
+            NPM_REGISTRY=${{ inputs.npm_registry || 'https://registry.npmjs.org' }}
           push: true
           tags: |
             ghcr.io/${{ steps.owner.outputs.lower }}/${{ matrix.image }}:${{ needs.resolve-version.outputs.version }}

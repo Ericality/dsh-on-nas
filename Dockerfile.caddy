@@ -2,7 +2,7 @@
 # HTTPS 变体 (可选): 与 ghcr.io/kanzuori197/deepseek-harness-nas 完全等价
 # Caddy + 自签名证书 + basic auth, 对外 https://NAS_IP:8443
 # 默认方案是 Dockerfile (无 HTTPS), 只有确实需要 HTTPS 时才用这个。
-# 用法: docker build -f Dockerfile.caddy -t dsh-nas-https:0.1.0-rc.6 .
+# 用法: docker build -f Dockerfile.caddy -t dsh-nas-https:0.2.2-rc.5 .
 # ============================================================
 
 # ---- 阶段1: 从官方 caddy:2.10 取 caddy 二进制 (digest = SLSA provenance 记录值) ----
@@ -10,9 +10,12 @@ FROM caddy:2.10@sha256:c3d7ee5d2b11f9dc54f947f68a734c84e9c9666c92c88a7f30b9cba5d
 # 官方 caddy 二进制 sha256: 4ef1f68c70219536b2711fd16547a79841a2dec2d6b4e56b1e3e5e9da76028e6
 
 # ---- 阶段2: 最终镜像 ----
-FROM node:22-bookworm@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d4350ea9c3d9494a
+# 基础镜像与 Dockerfile 同源: node:24 LTS (Krypton), dsh 0.2.2 起 engines.node >= 24.9.0。
+# digest 固定 = node 24.22.3 (2026-11-12 发布); 复核周期: 每月一次, 下次 2026-12-19。
+FROM node:24-bookworm@sha256:9d266751ca3d7fdbe651c878ffd5ad0a42fed49a18c283509267c97f025b7496
 
-ARG DSH_VERSION=0.1.0-rc.6
+ARG DSH_VERSION=0.2.2-rc.5
+ARG NPM_REGISTRY=https://registry.npmjs.org
 
 ENV HOME=/data/dsh \
     DSH_HOME=/data/dsh \
@@ -27,7 +30,7 @@ RUN apt-get update \
        g++ \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install --global --no-audit --no-fund "@deepseek-ai/dsh@${DSH_VERSION}" \
+RUN npm install --global --no-audit --no-fund --registry="${NPM_REGISTRY}" "@deepseek-ai/dsh@${DSH_VERSION}" \
     && dsh --help >/dev/null
 
 COPY --from=caddy /usr/bin/caddy /usr/local/bin/caddy

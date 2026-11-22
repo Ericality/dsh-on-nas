@@ -16,13 +16,14 @@
 #   - dsh web        127.0.0.1:3081  (仅回环)
 #   - auth-proxy     0.0.0.0:3080    (对外, 登录页 + 转发)
 #
-# 用法: docker build -t dsh-nas:0.1.0-rc.7 .
+# 用法: docker build -t dsh-nas:0.2.2-rc.5 .
 # ============================================================
 
-# 基础镜像 digest 固定 (与已审计的 ghcr.io 镜像同一基础, 逐层一致)
-FROM node:22-bookworm@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d4350ea9c3d9494a
+# 基础镜像: node:24 LTS (Krypton)。dsh 0.2.2 起 engines.node >= 24.9.0, node:22 不再受支持。
+# digest 固定 = node 24.22.3 (2026-11-12 发布); 复核周期: 每月一次, 下次 2026-12-19。
+FROM node:24-bookworm@sha256:9d266751ca3d7fdbe651c878ffd5ad0a42fed49a18c283509267c97f025b7496
 
-ARG DSH_VERSION=0.1.0-rc.7
+ARG DSH_VERSION=0.2.2-rc.5
 ARG NPM_REGISTRY=https://registry.npmjs.org
 
 ENV HOME=/data/dsh \
